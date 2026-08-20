@@ -1,0 +1,50 @@
+{
+  "name": "gantt-cli",
+  "version": "0.1.0-alpha.0",
+  "description": "A Git worktree scheduler for coding agents",
+  "author": "ZhiyeTang <tangzhiye2022@foxmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZhiyeTang/Gantt-CLI.git"
+  },
+  "homepage": "https://github.com/ZhiyeTang/Gantt-CLI#readme",
+  "bugs": {
+    "url": "https://github.com/ZhiyeTang/Gantt-CLI/issues"
+  },
+  "type": "module",
+  "bin": {
+    "gantt-cli": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.js",
+    "prepack": "npm run build",
+    "release:alpha": "npm publish --tag next"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "coding-agents",
+    "git",
+    "worktree",
+    "scheduler",
+    "cli"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}
