@@ -6,6 +6,10 @@
 
 > **Worktree-first 开发：** 在 Agent 修改任何文件之前，先为每项工作创建独立的 branch 和 worktree。默认隔离、显式协调，并以 Git 事实验证完成状态。
 
+<p align="center">
+  <img src="./assets/gantt-cli-demo.gif" alt="Gantt-CLI 将任务调度到独立的 Git worktree，并验证交付结果" width="900" />
+</p>
+
 Coding Agent 很快，协调不是。
 
 当多个 Agent 同时改一个仓库时，真正麻烦的通常不是生成代码，而是：谁负责什么、哪些任务会改到同一批文件、分支是否已经合并、失败后该从哪里继续。

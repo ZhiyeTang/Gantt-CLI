@@ -6,6 +6,10 @@ English | [简体中文](./README.zh-CN.md)
 
 > **Worktree-first development:** give every unit of work its own branch and worktree before an agent edits a file. Isolation is the default, coordination is explicit, and completion is verified against Git.
 
+<p align="center">
+  <img src="./assets/gantt-cli-demo.gif" alt="Gantt-CLI schedules requirements into isolated Git worktrees and verifies delivery" width="900" />
+</p>
+
 Coding agents are fast. Coordination is not.
 
 When several agents work in the same repository, the hard part is rarely generating code. It is knowing who owns what, which tasks touch the same files, whether a branch was actually merged, and where to resume after an interrupted run.
