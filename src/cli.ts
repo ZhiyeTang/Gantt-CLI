@@ -8,12 +8,15 @@ import { GanttCliError, GitError, ValidationError } from "./errors.js";
 import { AGENT_INSTRUCTIONS, installAgentInstructions } from "./agent-instructions.js";
 import {
   commonGitDir,
-  branchIsMerged,
   branchExists,
   changedPathsSince,
+  commitExists,
+  commitIsAncestor,
+  commitParent,
   createWorktree,
   defaultWorktreeRoot,
   ensureWorktreeClean,
+  headCommit,
   initializeSubmodules,
   mergeBranch,
   primaryWorktree,
@@ -29,7 +32,6 @@ import {
   assignmentById,
   assignmentsForRequirement,
   liveAssignmentForRequirement,
-  LIVE_ASSIGNMENT_STATUSES,
   nextRequirementId,
   normalizeDomains,
   normalizePriority,
@@ -224,6 +226,16 @@ function updateAssignment(assignment: Assignment, status: string): void {
   assignment.updatedAt = utcNow();
 }
 
+function rollbackAndRethrow(error: unknown, repository: string, branch: string, worktree: string): never {
+  const failures = rollbackCreatedAssignment(repository, branch, worktree);
+  if (failures.length > 0) {
+    const detail = `\nRollback also failed:\n${failures.map((failure) => `- ${failure}`).join("\n")}`;
+    if (error instanceof Error) error.message += detail;
+    else throw new GitError(`${String(error)}${detail}`);
+  }
+  throw error;
+}
+
 function output(value: unknown, asJson: boolean): void {
   if (asJson) {
     process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -361,7 +373,7 @@ function handleStart(args: ParsedArguments): number {
     created = true;
     verifyAssignmentWorktree(primary, worktree, branch, commonGitDir(primary));
   } catch (error) {
-    if (created) rollbackCreatedAssignment(primary, branch, worktree);
+    if (created) rollbackAndRethrow(error, primary, branch, worktree);
     throw error;
   }
 
@@ -396,8 +408,7 @@ function handleStart(args: ParsedArguments): number {
     try {
       registry.write(state);
     } catch (writeError) {
-      rollbackCreatedAssignment(primary, branch, worktree);
-      throw writeError;
+      rollbackAndRethrow(writeError, primary, branch, worktree);
     }
     output({
       requirementId: requirement.id,
@@ -427,8 +438,7 @@ function handleStart(args: ParsedArguments): number {
   try {
     registry.write(state);
   } catch (error) {
-    rollbackCreatedAssignment(primary, branch, worktree);
-    throw error;
+    rollbackAndRethrow(error, primary, branch, worktree);
   }
   output({
     requirement: requirementView(state, requirement),
@@ -530,22 +540,90 @@ function transitionRecords(args: ParsedArguments): {
   return { registry, state, primary, requirement, assignment };
 }
 
+interface MergeEvidenceProblem { code: string; message: string }
+
+function mergeEvidenceProblem(repository: string, assignment: Assignment): MergeEvidenceProblem | undefined {
+  if (!assignment.sourceCommit) {
+    return { code: "missing_source_commit", message: `Assignment ${assignment.id} has no recorded sourceCommit.` };
+  }
+  if (!commitExists(repository, assignment.sourceCommit)) {
+    return {
+      code: "missing_source_commit",
+      message: `Recorded source commit is missing for ${assignment.id}: ${assignment.sourceCommit}`,
+    };
+  }
+  if (!assignment.mergeCommit) {
+    return { code: "missing_merge_commit", message: `Assignment ${assignment.id} has no recorded mergeCommit.` };
+  }
+  if (!commitExists(repository, assignment.mergeCommit)) {
+    return {
+      code: "missing_merge_commit",
+      message: `Recorded merge commit is missing for ${assignment.id}: ${assignment.mergeCommit}`,
+    };
+  }
+  if (commitParent(repository, assignment.mergeCommit, 2) !== assignment.sourceCommit) {
+    return {
+      code: "merge_topology",
+      message: `Recorded merge commit ${assignment.mergeCommit} does not have sourceCommit ${assignment.sourceCommit} as its second parent.`,
+    };
+  }
+  if (!commitIsAncestor(repository, assignment.mergeCommit)) {
+    return {
+      code: "merge_not_in_head",
+      message: `Recorded merge commit ${assignment.mergeCommit} is not an ancestor of current HEAD.`,
+    };
+  }
+  return undefined;
+}
+
+function verifiedMergeEvidence(repository: string, assignment: Assignment): { sourceCommit: string; mergeCommit: string } {
+  const problem = mergeEvidenceProblem(repository, assignment);
+  if (problem) throw new GitError(problem.message);
+  return { sourceCommit: assignment.sourceCommit as string, mergeCommit: assignment.mergeCommit as string };
+}
+
 function handleMerge(args: ParsedArguments): number {
   const { registry, state, primary, requirement, assignment } = transitionRecords(args);
-  if (requirement.status !== "active" || assignment.status !== "active") {
-    throw new ValidationError(`${requirement.id} must be active to merge.`);
+  if (requirement.status !== "active" || !["active", "merged"].includes(assignment.status)) {
+    throw new ValidationError(`${requirement.id} must have an active or merged assignment to merge.`);
+  }
+  let previousSource: string | undefined;
+  if (assignment.status === "merged") {
+    previousSource = verifiedMergeEvidence(primary, assignment).sourceCommit;
+    if (!registeredWorktree(primary, assignment.worktree)) {
+      output({ assignment, message: `${assignment.id} is already merged.` }, args.flags.has("json"));
+      return 0;
+    }
   }
   verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
   ensureWorktreeClean(assignment.worktree);
-  const merged = mergeBranch(primary, assignment.branch, option(args, "into"));
+  const sourceCommit = headCommit(assignment.worktree);
+  if (sourceCommit === previousSource) {
+    output({ assignment, message: `${assignment.id} is already merged.` }, args.flags.has("json"));
+    return 0;
+  }
+  const changedPaths = changedPathsSince(primary, assignment.baseCommit, sourceCommit);
+  const outsideScope = outOfScopePaths(requirement, changedPaths);
+  if (outsideScope.length > 0) {
+    throw new ValidationError(
+      `Committed changes exceed ${requirement.id} path claims: ${outsideScope.join(", ")}`,
+    );
+  }
+  const merged = mergeBranch(primary, assignment.branch, sourceCommit, option(args, "into"));
   updateAssignment(assignment, "merged");
+  assignment.sourceCommit = merged.sourceCommit;
   assignment.mergedInto = merged.targetBranch;
   assignment.mergeCommit = merged.mergeCommit;
   assignment.mergedAt = utcNow();
   appendEvent(state, "assignment.merged", {
     requirementId: requirement.id,
     assignmentId: assignment.id,
-    data: { targetBranch: merged.targetBranch, mergeCommit: merged.mergeCommit },
+    data: {
+      sourceCommit: merged.sourceCommit,
+      targetBranch: merged.targetBranch,
+      mergeCommit: merged.mergeCommit,
+      changedPaths,
+    },
   });
   registry.write(state);
   output({ assignment, message: `Merged ${assignment.branch} into ${merged.targetBranch}.` }, args.flags.has("json"));
@@ -564,9 +642,7 @@ function handleCleanup(args: ParsedArguments): number {
   if (assignment.status !== "merged") {
     throw new ValidationError(`${assignment.id} must be merged before cleanup.`);
   }
-  if (!branchIsMerged(primary, assignment.branch)) {
-    throw new GitError(`Assignment branch is not merged into current HEAD: ${assignment.branch}`);
-  }
+  const evidence = verifiedMergeEvidence(primary, assignment);
   const record = registeredWorktree(primary, assignment.worktree);
   if (!record) {
     if (assignment.cleanupPending) {
@@ -586,6 +662,9 @@ function handleCleanup(args: ParsedArguments): number {
     );
   }
   verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
+  if (headCommit(assignment.worktree) !== evidence.sourceCommit) {
+    throw new GitError(`Assignment branch advanced after merge: ${assignment.branch}. Run merge again before cleanup.`);
+  }
   ensureWorktreeClean(assignment.worktree);
   if (!assignment.cleanupPending) {
     assignment.cleanupPending = true;
@@ -623,16 +702,7 @@ function handleDone(args: ParsedArguments): number {
   if (registeredWorktree(primary, assignment.worktree) || existsSync(assignment.worktree)) {
     throw new GitError("Assignment worktree still exists; run cleanup before done.");
   }
-  if (!branchIsMerged(primary, assignment.branch)) {
-    throw new GitError(`Assignment branch is not merged into current HEAD: ${assignment.branch}`);
-  }
-  const changedPaths = changedPathsSince(primary, assignment.baseCommit, assignment.branch);
-  const outsideScope = outOfScopePaths(requirement, changedPaths);
-  if (outsideScope.length > 0) {
-    throw new ValidationError(
-      `Committed changes exceed ${requirement.id} path claims: ${outsideScope.join(", ")}`,
-    );
-  }
+  const evidence = verifiedMergeEvidence(primary, assignment);
   if (requirement.verify) {
     const verification = spawnSync(requirement.verify, {
       cwd: primary,
@@ -669,7 +739,7 @@ function handleDone(args: ParsedArguments): number {
   appendEvent(state, "requirement.done", {
     requirementId: requirement.id,
     assignmentId: assignment.id,
-    data: { changedPaths },
+    data: evidence,
   });
   registry.write(state);
   output({ requirement, assignment, message: `Completed ${requirement.id}.` }, args.flags.has("json"));
@@ -893,14 +963,28 @@ function doctorIssues(currentRoot: string, state: State): DoctorIssue[] {
   for (const assignment of state.assignments) {
     const status = assignment.status;
     const record = registeredWorktree(primary, assignment.worktree);
+    const branchMissing = ["active", "blocked"].includes(status) && !branchExists(primary, assignment.branch);
+    if (branchMissing) {
+      issues.push({
+        severity: "error", code: "missing_branch", assignmentId: assignment.id,
+        message: `Branch is missing: ${assignment.branch}`,
+      });
+    }
     if (status === "merged" && assignment.cleanupPending && !record) {
       issues.push({
         severity: "warning", code: "cleanup_recovery", assignmentId: assignment.id,
         message: "Worktree was removed after cleanupPending; rerun cleanup to finalize state.",
       });
-    } else if (["active", "blocked", "merged"].includes(status)) {
+    } else if (["active", "blocked", "merged"].includes(status) && !branchMissing) {
       try {
         verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, expectedCommonDirectory);
+        if (status === "merged" && assignment.sourceCommit
+          && headCommit(assignment.worktree) !== assignment.sourceCommit) {
+          issues.push({
+            severity: "error", code: "branch_advanced_after_merge", assignmentId: assignment.id,
+            message: `Assignment branch advanced after merge: ${assignment.branch}. Run merge again before cleanup.`,
+          });
+        }
       } catch (error) {
         if (!(error instanceof GanttCliError)) throw error;
         issues.push({ severity: "error", code: "assignment_binding", assignmentId: assignment.id, message: error.message });
@@ -937,11 +1021,13 @@ function doctorIssues(currentRoot: string, state: State): DoctorIssue[] {
         message: "Legacy assignment has no verifiable historical base commit.",
       });
     }
-    if (LIVE_ASSIGNMENT_STATUSES.has(status) && !branchExists(primary, assignment.branch)) {
-      issues.push({
-        severity: "error", code: "missing_branch", assignmentId: assignment.id,
-        message: `Branch is missing: ${assignment.branch}`,
-      });
+    if (["merged", "cleaned"].includes(status)) {
+      const problem = mergeEvidenceProblem(primary, assignment);
+      if (problem) {
+        issues.push({
+          severity: "error", code: problem.code, assignmentId: assignment.id, message: problem.message,
+        });
+      }
     }
   }
   return issues;

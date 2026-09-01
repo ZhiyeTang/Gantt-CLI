@@ -23,7 +23,8 @@ When a user introduces an implementation requirement:
 3. Read \`npx gantt-cli@next schedule --json\`; start only a requirement in the first batch unless the user authorizes \`--force\`.
 4. Run \`npx gantt-cli@next start REQ-XXXX --session <current-session-id> --alias <name> --json\`, then edit only the returned worktree.
 5. Commit there, then run \`npx gantt-cli@next merge REQ-XXXX\` → \`npx gantt-cli@next cleanup REQ-XXXX\` → \`npx gantt-cli@next done REQ-XXXX\` from the primary worktree.
-6. Use \`block\`, \`unblock\`, and \`abandon\` for interruptions; use \`repair\` for retained provisioning failures and \`doctor\` for consistency checks.
+6. Do not add commits to an assignment after merge without running merge again. Once no worktree checks out its branch, the branch may be retained or deleted; cleanup never deletes it automatically, and done uses the recorded commits.
+7. Use \`block\`, \`unblock\`, and \`abandon\` for interruptions; use \`repair\` for retained provisioning failures and \`doctor\` for consistency checks.
 
 Completion criterion: the Requirement status is \`done\`; a commit or chat claim alone is incomplete.
 `;
