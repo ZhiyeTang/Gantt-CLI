@@ -69,7 +69,7 @@ A requirement cannot become `done` until its commit is merged, its worktree is c
 Gantt-CLI manages two core objects:
 
 - **Requirement:** the outcome to deliver, including its scope, dependencies, verification command, and status.
-- **Assignment:** one execution attempt, including its branch, worktree, base commit, and result commit.
+- **Assignment:** one execution attempt, including its branch, worktree, base commit, source commit, and merge commit.
 
 A requirement normally moves through this lifecycle:
 
@@ -119,6 +119,8 @@ npx gantt-cli@latest merge REQ-0001
 npx gantt-cli@latest cleanup REQ-0001
 npx gantt-cli@latest done REQ-0001
 ```
+
+`merge` checks the assignment's declared path scope before changing the target branch and records the exact source and merge commits. Do not add commits to the assignment branch after merging unless you run `merge` again. Once no worktree checks out the branch, you may retain or delete it: `cleanup` and `done` use the recorded commits, and `cleanup` never deletes the branch automatically.
 
 If submodule provisioning fails and the assignment worktree is retained:
 
@@ -175,7 +177,9 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 - State lives at `.git/gantt-cli/state.json` in the Git common dir and is not committed.
 - A lock file and atomic replacement protect concurrent writes.
 - Worktrees live in the adjacent `.gantt-worktrees/` directory by default.
-- `done` verifies merge ancestry and worktree cleanup, then runs the optional verification command in the primary worktree.
+- `merge` rejects out-of-scope paths before changing the primary worktree and records immutable source/merge commit evidence.
+- `cleanup` refuses uncommitted changes, including recursive submodule changes, before force-removing a verified-clean worktree.
+- `done` verifies recorded merge ancestry and worktree cleanup without requiring the assignment branch, then runs the optional verification command in the primary worktree.
 - Verification output and exit status are recorded on the assignment; a failure keeps completion retryable.
 - `repair` validates current Git facts before retrying a retained provisioning failure.
 

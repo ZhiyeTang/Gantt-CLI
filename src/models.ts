@@ -46,6 +46,12 @@ export interface Assignment extends JsonObject {
   branch: string;
   worktree: string;
   baseCommit: string;
+  sourceCommit?: string;
+  mergeCommit?: string;
+  mergedInto?: string;
+  mergedAt?: string;
+  cleanupPending?: boolean;
+  cleanupAt?: string;
   status: string;
   createdAt: string;
   updatedAt: string;

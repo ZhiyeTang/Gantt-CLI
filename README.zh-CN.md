@@ -69,7 +69,7 @@ Agent 会退出，终端会关闭，上下文会丢失。Gantt-CLI 把 requireme
 Gantt-CLI 管理两个核心对象：
 
 - **Requirement**：要交付的结果，包括范围、依赖、验证命令和状态。
-- **Assignment**：一次实际执行，包括 branch、worktree、base commit 和结果 commit。
+- **Assignment**：一次实际执行，包括 branch、worktree、base commit、source commit 和 merge commit。
 
 Requirement 通常按以下生命周期流转：
 
@@ -119,6 +119,8 @@ npx gantt-cli@latest merge REQ-0001
 npx gantt-cli@latest cleanup REQ-0001
 npx gantt-cli@latest done REQ-0001
 ```
+
+`merge` 会在修改目标分支前检查 assignment 声明的路径范围，并记录准确的 source commit 与 merge commit。合并后不要继续向 assignment branch 添加 commit；如果确实添加了，请再次运行 `merge`。当没有 worktree checkout 该 branch 后，可以选择保留或删除它：`cleanup` 和 `done` 使用已记录的 commit，且 `cleanup` 不会自动删除 branch。
 
 如果 submodule provisioning 失败且 assignment worktree 被保留：
 
@@ -175,7 +177,9 @@ npx gantt-cli@latest agent-instructions
 - 状态保存在 Git common dir 下的 `.git/gantt-cli/state.json`，不会进入项目提交。
 - 写入使用 lock file 和原子替换，避免多个进程破坏状态。
 - worktree 默认放在相邻的 `.gantt-worktrees/` 目录。
-- `done` 会检查合并关系和 worktree 清理情况，然后在主 worktree 中运行可选的验证命令。
+- `merge` 会在修改主 worktree 前拒绝越界路径，并记录不可变的 source/merge commit 证据。
+- `cleanup` 会拒绝所有未提交修改，包括递归 submodule 修改；确认干净后才强制删除 worktree。
+- `done` 使用已记录的 commit 检查合并关系和 worktree 清理情况，不要求 assignment branch 继续存在，然后在主 worktree 中运行可选的验证命令。
 - 验证输出和退出码会记录在 assignment 上；验证失败后仍可修复并重试完成操作。
 - `repair` 会先验证当前 Git 事实，再重试保留的 provisioning failure。
 

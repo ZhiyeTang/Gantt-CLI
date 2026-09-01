@@ -126,6 +126,7 @@ export function verifyAssignmentWorktree(
   if (record.branch !== expectedReference) {
     throw new GitError(`Worktree branch mismatch: expected ${expectedReference}, found ${record.branch ?? "detached HEAD"}.`);
   }
+  if (!branchExists(repository, branch)) throw new GitError(`Assignment branch is missing: ${branch}`);
   const actualRoot = repositoryRoot(worktree);
   if (commonGitDir(actualRoot) !== resolve(expectedCommonDirectory)) {
     throw new GitError(`Worktree belongs to a different Git repository: ${worktree}`);
@@ -135,41 +136,89 @@ export function verifyAssignmentWorktree(
   }
 }
 
-export function rollbackCreatedAssignment(repository: string, branch: string, worktree: string): void {
-  runGitResult(repository, ["worktree", "remove", worktree]);
-  runGitResult(repository, ["branch", "-D", branch]);
+export function rollbackCreatedAssignment(repository: string, branch: string, worktree: string): string[] {
+  const failures: string[] = [];
+  if (registeredWorktree(repository, worktree) || existsSync(worktree)) {
+    try {
+      removeWorktree(repository, worktree);
+    } catch (error) {
+      failures.push(`Could not remove retained worktree ${worktree}: ${(error as Error).message}`);
+    }
+  }
+  if (branchExists(repository, branch)) {
+    const deleted = runGitResult(repository, ["branch", "-D", branch]);
+    if (deleted.status !== 0) {
+      failures.push(`Could not remove retained branch ${branch}: ${deleted.stderr.trim() || deleted.stdout.trim()}`);
+    }
+  }
+  return failures;
 }
 
-export function worktreeIsClean(worktree: string): boolean {
-  const topLevel = runGit(worktree, ["status", "--porcelain=v1", "--ignore-submodules=none"]);
-  if (topLevel.trim()) return false;
+export interface SubmoduleChanges { path: string; changes: string[] }
+export interface WorktreeChanges { topLevel: string[]; submodules: SubmoduleChanges[] }
+
+export function worktreeChanges(worktree: string): WorktreeChanges {
+  const topLevel = runGit(worktree, ["status", "--porcelain=v1", "--ignore-submodules=none"])
+    .split("\n").filter(Boolean);
   const submodules = runGitResult(worktree, [
-    "submodule", "foreach", "--quiet", "--recursive", "git status --porcelain=v1",
+    "submodule", "foreach", "--quiet", "--recursive",
+    "status=$(git status --porcelain=v1) || exit $?; if test -n \"$status\"; then printf '%s\\n' \"$status\" | while IFS= read -r line; do printf '%s\\0%s\\0' \"$displaypath\" \"$line\"; done; fi",
   ]);
   if (submodules.status !== 0) {
     throw new GitError(
       `Could not verify submodule cleanliness in ${worktree}: ${submodules.stderr.trim() || "submodule status check failed"}`,
     );
   }
-  return !submodules.stdout.trim();
+  const grouped = new Map<string, string[]>();
+  const fields = submodules.stdout.split("\0");
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const path = fields[index];
+    const change = fields[index + 1];
+    if (!path || !change) continue;
+    grouped.set(path, [...(grouped.get(path) ?? []), change]);
+  }
+  return { topLevel, submodules: [...grouped].map(([path, changes]) => ({ path, changes })) };
 }
 
 export function ensureWorktreeClean(worktree: string): void {
-  if (!worktreeIsClean(worktree)) {
-    throw new GitError(`Worktree or submodule has uncommitted changes: ${worktree}`);
+  const changes = worktreeChanges(worktree);
+  if (changes.topLevel.length === 0 && changes.submodules.length === 0) return;
+  const details: string[] = [];
+  if (changes.topLevel.length > 0) {
+    details.push(`Worktree has uncommitted changes: ${worktree}`, ...changes.topLevel.map((line) => `  ${line}`));
   }
+  for (const submodule of changes.submodules) {
+    details.push(`Submodule ${submodule.path} has uncommitted changes:`, ...submodule.changes.map((line) => `  ${line}`));
+  }
+  throw new GitError(details.join("\n"));
 }
 
-export function branchIsMerged(repository: string, branch: string, target = "HEAD"): boolean {
-  return branchExists(repository, branch)
-    && runGitResult(repository, ["merge-base", "--is-ancestor", branch, target]).status === 0;
+export function commitExists(repository: string, commit: string): boolean {
+  return Boolean(commit) && runGitResult(repository, ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]).status === 0;
+}
+
+export function resolveCommit(repository: string, revision: string): string {
+  const result = runGitResult(repository, ["rev-parse", "--verify", `${revision}^{commit}`]);
+  if (result.status !== 0) throw new GitError(`Git commit is missing or invalid: ${revision}`);
+  return result.stdout.trim();
+}
+
+export function commitIsAncestor(repository: string, commit: string, target = "HEAD"): boolean {
+  return commitExists(repository, commit)
+    && runGitResult(repository, ["merge-base", "--is-ancestor", commit, target]).status === 0;
+}
+
+export function commitParent(repository: string, commit: string, parent: number): string | undefined {
+  const result = runGitResult(repository, ["rev-parse", "--verify", `${commit}^${parent}^{commit}`]);
+  return result.status === 0 ? result.stdout.trim() : undefined;
 }
 
 export function mergeBranch(
   repository: string,
   branch: string,
+  sourceCommit: string,
   expectedTargetBranch?: string,
-): { targetBranch: string; mergeCommit: string } {
+): { targetBranch: string; sourceCommit: string; mergeCommit: string } {
   const targetBranch = currentBranch(repository);
   if (expectedTargetBranch && targetBranch !== expectedTargetBranch) {
     throw new GitError(
@@ -178,21 +227,33 @@ export function mergeBranch(
     );
   }
   if (targetBranch === branch) throw new GitError("Cannot merge an assignment branch into itself.");
+  const currentSource = resolveCommit(repository, `refs/heads/${branch}`);
+  if (currentSource !== sourceCommit) {
+    throw new GitError(`Assignment branch advanced while merge was being prepared: ${branch}. Retry merge.`);
+  }
+  if (commitIsAncestor(repository, sourceCommit)) {
+    throw new GitError(`Assignment source ${sourceCommit} is already in current HEAD; merge would not create a new merge commit.`);
+  }
   ensureWorktreeClean(repository);
   runGit(repository, ["merge", "--no-ff", "--no-edit", branch]);
-  return { targetBranch, mergeCommit: headCommit(repository) };
+  const mergeCommit = headCommit(repository);
+  if (commitParent(repository, mergeCommit, 2) !== sourceCommit) {
+    throw new GitError(`Git did not create the expected merge commit for assignment source ${sourceCommit}.`);
+  }
+  return { targetBranch, sourceCommit, mergeCommit };
 }
 
-export function changedPathsSince(repository: string, baseCommit: string, branch: string): string[] {
+export function changedPathsSince(repository: string, baseCommit: string, sourceCommit: string): string[] {
   if (!baseCommit) {
     throw new GitError("Assignment has no baseCommit; use doctor to inspect this legacy assignment.");
   }
-  runGit(repository, ["rev-parse", "--verify", baseCommit]);
-  if (!branchExists(repository, branch)) throw new GitError(`Assignment branch no longer exists: ${branch}`);
-  return runGit(repository, ["diff", "--name-only", "--no-renames", `${baseCommit}..${branch}`])
+  const base = resolveCommit(repository, baseCommit);
+  const source = resolveCommit(repository, sourceCommit);
+  return runGit(repository, ["diff", "--name-only", "--no-renames", `${base}..${source}`])
     .split("\n").filter(Boolean);
 }
 
 export function removeWorktree(repository: string, worktree: string): void {
-  runGit(repository, ["worktree", "remove", worktree]);
+  ensureWorktreeClean(worktree);
+  runGit(repository, ["worktree", "remove", "--force", worktree]);
 }
