@@ -27,13 +27,13 @@ Gantt-CLI gives coding agents isolated worktrees, explicit file ownership, depen
 Run it without installing anything globally:
 
 ```bash
-npx gantt-cli@next --help
+npx gantt-cli@latest --help
 ```
 
 Initialize it from the root of a Git repository:
 
 ```bash
-npx gantt-cli@next init --install-agent-instructions
+npx gantt-cli@latest init --install-agent-instructions
 ```
 
 This command:
@@ -46,7 +46,7 @@ The adjacent worktree directory is created on demand when the first assignment s
 If you prefer a global command:
 
 ```bash
-npm install --global gantt-cli@next
+npm install --global gantt-cli@latest
 gantt-cli --help
 ```
 
@@ -89,12 +89,12 @@ The scheduler selects requirements whose dependencies are complete, whose scopes
 ### 1. Add requirements
 
 ```bash
-npx gantt-cli@next add \
+npx gantt-cli@latest add \
   --request "Add task API" \
   --path "src/api/**" \
   --verify "npm test"
 
-npx gantt-cli@next add \
+npx gantt-cli@latest add \
   --request "Build task UI" \
   --path "src/ui/**" \
   --depends-on REQ-0001 \
@@ -106,8 +106,8 @@ npx gantt-cli@next add \
 ### 2. Schedule and start work
 
 ```bash
-npx gantt-cli@next schedule
-npx gantt-cli@next start REQ-0001 --session agent-1 --alias task-api
+npx gantt-cli@latest schedule
+npx gantt-cli@latest start REQ-0001 --session agent-1 --alias task-api
 ```
 
 `start` prints the branch and worktree it created. Enter that worktree, make the change, and commit it normally.
@@ -115,15 +115,15 @@ npx gantt-cli@next start REQ-0001 --session agent-1 --alias task-api
 ### 3. Merge and finish
 
 ```bash
-npx gantt-cli@next merge REQ-0001
-npx gantt-cli@next cleanup REQ-0001
-npx gantt-cli@next done REQ-0001
+npx gantt-cli@latest merge REQ-0001
+npx gantt-cli@latest cleanup REQ-0001
+npx gantt-cli@latest done REQ-0001
 ```
 
 If submodule provisioning fails and the assignment worktree is retained:
 
 ```bash
-npx gantt-cli@next repair ASN-0001
+npx gantt-cli@latest repair ASN-0001
 ```
 
 `repair` validates the retained branch and worktree binding, then retries recursive submodule initialization.
@@ -151,7 +151,7 @@ npx gantt-cli@next repair ASN-0001
 The main query and workflow commands support `--json`. For complete options:
 
 ```bash
-npx gantt-cli@next <command> --help
+npx gantt-cli@latest <command> --help
 ```
 
 ## Agent integration
@@ -159,13 +159,13 @@ npx gantt-cli@next <command> --help
 The repository maintainer runs this once:
 
 ```bash
-npx gantt-cli@next init --install-agent-instructions
+npx gantt-cli@latest init --install-agent-instructions
 ```
 
 Agents that read `AGENTS.md` will find a short pointer telling them to load the current protocol before implementation:
 
 ```bash
-npx gantt-cli@next agent-instructions
+npx gantt-cli@latest agent-instructions
 ```
 
 Installation preserves existing `AGENTS.md` content. It manages only a marked block and is safe to run repeatedly.
@@ -196,7 +196,7 @@ npm test
 npm run build
 ```
 
-Alpha releases are published under the `next` dist-tag:
+Alpha releases are published under the `latest` dist-tag:
 
 ```bash
 npm run release:alpha

@@ -27,13 +27,13 @@ Gantt-CLI 为 Coding Agent 提供隔离的 worktree、明确的文件所有权�
 无需全局安装：
 
 ```bash
-npx gantt-cli@next --help
+npx gantt-cli@latest --help
 ```
 
 在 Git 仓库根目录初始化：
 
 ```bash
-npx gantt-cli@next init --install-agent-instructions
+npx gantt-cli@latest init --install-agent-instructions
 ```
 
 这会：
@@ -46,7 +46,7 @@ npx gantt-cli@next init --install-agent-instructions
 如果你更喜欢全局命令：
 
 ```bash
-npm install --global gantt-cli@next
+npm install --global gantt-cli@latest
 gantt-cli --help
 ```
 
@@ -89,12 +89,12 @@ blocked  blocked
 ### 1. 添加任务
 
 ```bash
-npx gantt-cli@next add \
+npx gantt-cli@latest add \
   --request "Add task API" \
   --path "src/api/**" \
   --verify "npm test"
 
-npx gantt-cli@next add \
+npx gantt-cli@latest add \
   --request "Build task UI" \
   --path "src/ui/**" \
   --depends-on REQ-0001 \
@@ -106,8 +106,8 @@ npx gantt-cli@next add \
 ### 2. 调度并开始工作
 
 ```bash
-npx gantt-cli@next schedule
-npx gantt-cli@next start REQ-0001 --session agent-1 --alias task-api
+npx gantt-cli@latest schedule
+npx gantt-cli@latest start REQ-0001 --session agent-1 --alias task-api
 ```
 
 `start` 会输出新建的 branch 和 worktree。进入该 worktree，正常修改并提交代码。
@@ -115,15 +115,15 @@ npx gantt-cli@next start REQ-0001 --session agent-1 --alias task-api
 ### 3. 合并并完成
 
 ```bash
-npx gantt-cli@next merge REQ-0001
-npx gantt-cli@next cleanup REQ-0001
-npx gantt-cli@next done REQ-0001
+npx gantt-cli@latest merge REQ-0001
+npx gantt-cli@latest cleanup REQ-0001
+npx gantt-cli@latest done REQ-0001
 ```
 
 如果 submodule provisioning 失败且 assignment worktree 被保留：
 
 ```bash
-npx gantt-cli@next repair ASN-0001
+npx gantt-cli@latest repair ASN-0001
 ```
 
 `repair` 会验证保留的 branch/worktree 绑定，然后重试递归 submodule 初始化。
@@ -151,7 +151,7 @@ npx gantt-cli@next repair ASN-0001
 主要查询和工作流命令都支持 `--json`。完整参数请运行：
 
 ```bash
-npx gantt-cli@next <command> --help
+npx gantt-cli@latest <command> --help
 ```
 
 ## Agent 集成
@@ -159,13 +159,13 @@ npx gantt-cli@next <command> --help
 仓库维护者只需运行一次：
 
 ```bash
-npx gantt-cli@next init --install-agent-instructions
+npx gantt-cli@latest init --install-agent-instructions
 ```
 
 支持读取 `AGENTS.md` 的 Agent 会看到一条简短入口，并在开始实现前加载当前协议：
 
 ```bash
-npx gantt-cli@next agent-instructions
+npx gantt-cli@latest agent-instructions
 ```
 
 安装过程不会覆盖已有的 `AGENTS.md` 内容；它只维护一个带标记的区块，重复执行是幂等的。
@@ -196,7 +196,7 @@ npm test
 npm run build
 ```
 
-Alpha 版本统一发布到 `next` dist-tag：
+Alpha 版本统一发布到 `latest` dist-tag：
 
 ```bash
 npm run release:alpha

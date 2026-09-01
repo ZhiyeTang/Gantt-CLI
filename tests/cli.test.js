@@ -482,7 +482,7 @@ test("doctor reports retained abandoned worktrees as recoverable warnings", () =
 test("help and agent-instructions expose the complete CLI contract", () => {
   const version = invoke("--version");
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(version.stdout.trim(), "0.1.0-alpha.0");
+  assert.equal(version.stdout.trim(), "0.1.0-alpha.1");
 
   const help = invoke("--help");
   assert.equal(help.status, 0, help.stderr);

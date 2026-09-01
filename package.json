@@ -1,6 +1,6 @@
 {
   "name": "gantt-cli",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "A Git worktree scheduler for coding agents",
   "author": "ZhiyeTang <tangzhiye2022@foxmail.com>",
   "repository": {
@@ -26,7 +26,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test tests/*.test.js",
     "prepack": "npm run build",
-    "release:alpha": "npm publish --tag next"
+    "release:alpha": "npm publish --tag latest"
   },
   "engines": {
     "node": ">=20"
@@ -41,7 +41,7 @@
   "license": "MIT",
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
