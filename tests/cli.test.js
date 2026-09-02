@@ -287,6 +287,35 @@ test("update rejects new active claim conflicts unless explicitly forced", () =>
   }
 });
 
+test("update does not require force again for an existing accepted conflict", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    for (const request of ["First", "Second"]) {
+      assert.equal(invoke(
+        "add", "--repo", project.repository, "--request", request, "--path", "src/shared.ts",
+      ).status, 0);
+    }
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0001",
+      "--session", "session-one", "--alias", "first",
+    ).status, 0);
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0002",
+      "--session", "session-two", "--alias", "second", "--force",
+    ).status, 0);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0002", "--add-path", "Package.resolved", "--json",
+    );
+
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/shared.ts", "Package.resolved"]);
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("update rejects path changes after the assignment is merged", () => {
   const project = fixture();
   try {

@@ -334,7 +334,9 @@ function handleUpdate(args: ParsedArguments): number {
       ...previousPaths.filter((path) => !removedPaths.includes(path)),
       ...requestedPaths,
     ]);
-    const conflicts = activeConflicts(state, { ...requirement, paths });
+    const previousConflictAssignments = new Set(activeConflicts(state, requirement).map((item) => item.assignmentId));
+    const conflicts = activeConflicts(state, { ...requirement, paths })
+      .filter((item) => !previousConflictAssignments.has(item.assignmentId));
     if (conflicts.length > 0 && !args.flags.has("force")) {
       const blockers = conflicts.map((item) => `${item.requirementId}/${item.assignmentId}`).join(", ");
       throw new ValidationError(
