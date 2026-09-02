@@ -178,7 +178,7 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 - A lock file and atomic replacement protect concurrent writes.
 - Worktrees live in the adjacent `.gantt-worktrees/` directory by default.
 - `merge` rejects out-of-scope paths before changing the primary worktree and records immutable source/merge commit evidence.
-- `cleanup` refuses uncommitted changes, including recursive submodule changes, before force-removing a verified-clean worktree.
+- `cleanup` refuses uncommitted changes, including recursive submodule changes, and preserves nested repositories whose Git data exists only inside the worktree.
 - `done` verifies recorded merge ancestry and worktree cleanup without requiring the assignment branch, then runs the optional verification command in the primary worktree.
 - Verification output and exit status are recorded on the assignment; a failure keeps completion retryable.
 - `repair` validates current Git facts before retrying a retained provisioning failure.

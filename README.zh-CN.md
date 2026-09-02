@@ -178,7 +178,7 @@ npx gantt-cli@latest agent-instructions
 - 写入使用 lock file 和原子替换，避免多个进程破坏状态。
 - worktree 默认放在相邻的 `.gantt-worktrees/` 目录。
 - `merge` 会在修改主 worktree 前拒绝越界路径，并记录不可变的 source/merge commit 证据。
-- `cleanup` 会拒绝所有未提交修改，包括递归 submodule 修改；确认干净后才强制删除 worktree。
+- `cleanup` 会拒绝所有未提交修改，包括递归 submodule 修改；如果嵌套仓库的 Git 数据仅存在于 worktree 内，也会保留 worktree 并拒绝删除。
 - `done` 使用已记录的 commit 检查合并关系和 worktree 清理情况，不要求 assignment branch 继续存在，然后在主 worktree 中运行可选的验证命令。
 - 验证输出和退出码会记录在 assignment 上；验证失败后仍可修复并重试完成操作。
 - `repair` 会先验证当前 Git 事实，再重试保留的 provisioning failure。

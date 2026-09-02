@@ -314,6 +314,38 @@ test("cleanup force-removes clean submodule worktrees and reports every dirty pa
   }
 });
 
+test("cleanup preserves nested Git repositories whose objects exist only inside the worktree", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { path: "**" });
+    const nestedRepository = join(assignment.worktree, "External", "package");
+    mkdirSync(nestedRepository, { recursive: true });
+    git(nestedRepository, "init", "-b", "main");
+    git(nestedRepository, "config", "user.email", "tests@example.invalid");
+    git(nestedRepository, "config", "user.name", "gantt-cli tests");
+    writeFileSync(join(nestedRepository, "package.txt"), "durable only here\n");
+    git(nestedRepository, "add", "package.txt");
+    git(nestedRepository, "commit", "-m", "package commit");
+    writeFileSync(
+      join(assignment.worktree, ".gitmodules"),
+      "[submodule \"External/package\"]\n\tpath = External/package\n\turl = ./External/package\n",
+    );
+    git(assignment.worktree, "add", ".gitmodules", "External/package");
+    git(assignment.worktree, "commit", "-m", "add embedded package repository");
+    const merged = invoke("merge", "--repo", project.repository, "REQ-0001");
+    assert.equal(merged.status, 0, merged.stderr);
+
+    const cleaned = invoke("cleanup", "--repo", project.repository, "REQ-0001");
+
+    assert.equal(cleaned.status, 2);
+    assert.match(cleaned.stderr, /nested Git repositories store data inside it/);
+    assert.match(cleaned.stderr, /External\/package/);
+    assert.equal(readFileSync(join(nestedRepository, "package.txt"), "utf8"), "durable only here\n");
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("done and doctor use recorded commits after the merged branch is deleted", () => {
   const project = fixture();
   try {

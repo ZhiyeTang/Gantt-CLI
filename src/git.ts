@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { GitError, ValidationError } from "./errors.js";
 
@@ -253,7 +253,43 @@ export function changedPathsSince(repository: string, baseCommit: string, source
     .split("\n").filter(Boolean);
 }
 
+function nestedRepositoriesStoredInside(worktree: string): { repository: string; gitDirectory: string }[] {
+  const root = resolve(worktree);
+  const directories = [root];
+  const nested = [];
+  while (directories.length > 0) {
+    const directory = directories.pop() as string;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === ".git") {
+        if (directory === root) continue;
+        const discovered = runGitResult(directory, ["rev-parse", "--absolute-git-dir"]);
+        const gitDirectory = resolve(discovered.status === 0 ? discovered.stdout.trim() : join(directory, ".git"));
+        const relation = relative(root, gitDirectory);
+        if (relation === "" || (!isAbsolute(relation) && relation !== ".." && !relation.startsWith(`..${sep}`))) {
+          nested.push({ repository: directory, gitDirectory });
+        }
+        continue;
+      }
+      if (entry.isDirectory()) directories.push(join(directory, entry.name));
+    }
+  }
+  return nested;
+}
+
 export function removeWorktree(repository: string, worktree: string): void {
   ensureWorktreeClean(worktree);
+  const nested = nestedRepositoriesStoredInside(worktree);
+  if (nested.length > 0) {
+    const details = nested.map((item) => {
+      const repositoryPath = relative(worktree, item.repository).replaceAll(sep, "/");
+      const gitPath = relative(worktree, item.gitDirectory).replaceAll(sep, "/");
+      return `  ${repositoryPath} (Git data: ${gitPath})`;
+    });
+    throw new GitError([
+      `Refusing to remove worktree because nested Git repositories store data inside it: ${worktree}`,
+      ...details,
+      "Move or push these repositories to durable storage before cleanup.",
+    ].join("\n"));
+  }
   runGit(repository, ["worktree", "remove", "--force", worktree]);
 }
