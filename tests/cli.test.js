@@ -190,6 +190,150 @@ test("add records an optional verification command", () => {
   }
 });
 
+test("update adds path claims so an active assignment can recover from a rejected merge", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    writeFileSync(join(assignment.worktree, ".gitmodules"), "# package metadata\n");
+    writeFileSync(join(assignment.worktree, "Package.resolved"), "{}\n");
+    git(assignment.worktree, "add", ".gitmodules", "Package.resolved");
+    git(assignment.worktree, "commit", "-m", "add package metadata");
+    const rejected = invoke("merge", "--repo", project.repository, "REQ-0001");
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /\.gitmodules, Package\.resolved/);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0001",
+      "--add-path", ".gitmodules", "--add-path", "Package.resolved", "--json",
+    );
+
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/**", ".gitmodules", "Package.resolved"]);
+    const logged = invoke("log", "--repo", project.repository, "--requirement", "REQ-0001", "--json");
+    const event = JSON.parse(logged.stdout).events.at(-1);
+    assert.equal(event.type, "requirement.paths_updated");
+    assert.deepEqual(event.data.addedPaths, [".gitmodules", "Package.resolved"]);
+    assert.equal(invoke("doctor", "--repo", project.repository).status, 0);
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update removes path claims without allowing an empty scope", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository,
+      "--request", "Trim scope", "--path", "src/**", "--path", "docs/**",
+    ).status, 0);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0001", "--remove-path", "docs/**", "--json",
+    );
+
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/**"]);
+    const event = JSON.parse(invoke(
+      "log", "--repo", project.repository, "--requirement", "REQ-0001", "--json",
+    ).stdout).events.at(-1);
+    assert.deepEqual(event.data.removedPaths, ["docs/**"]);
+    const empty = invoke(
+      "update", "--repo", project.repository, "REQ-0001", "--remove-path", "src/**",
+    );
+    assert.equal(empty.status, 2);
+    assert.match(empty.stderr, /At least one --path or --paths claim is required/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update rejects new active claim conflicts unless explicitly forced", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    for (const [request, path] of [["First", "src/first.ts"], ["Second", "src/second.ts"]]) {
+      assert.equal(invoke(
+        "add", "--repo", project.repository, "--request", request, "--path", path,
+      ).status, 0);
+    }
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0001",
+      "--session", "session-one", "--alias", "first",
+    ).status, 0);
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0002",
+      "--session", "session-two", "--alias", "second",
+    ).status, 0);
+
+    const rejected = invoke(
+      "update", "--repo", project.repository, "REQ-0002", "--add-path", "src/first.ts",
+    );
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /conflicts with active claims held by REQ-0001\/ASN-0001/);
+
+    const forced = invoke(
+      "update", "--repo", project.repository, "REQ-0002", "--add-path", "src/first.ts", "--force", "--json",
+    );
+    assert.equal(forced.status, 0, forced.stderr);
+    const event = JSON.parse(invoke(
+      "log", "--repo", project.repository, "--requirement", "REQ-0002", "--json",
+    ).stdout).events.at(-1);
+    assert.equal(event.data.forced, true);
+    assert.equal(event.data.conflicts[0].requirementId, "REQ-0001");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update does not require force again for an existing accepted conflict", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    for (const request of ["First", "Second"]) {
+      assert.equal(invoke(
+        "add", "--repo", project.repository, "--request", request, "--path", "src/shared.ts",
+      ).status, 0);
+    }
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0001",
+      "--session", "session-one", "--alias", "first",
+    ).status, 0);
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0002",
+      "--session", "session-two", "--alias", "second", "--force",
+    ).status, 0);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0002", "--add-path", "Package.resolved", "--json",
+    );
+
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/shared.ts", "Package.resolved"]);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update rejects path changes after the assignment is merged", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0001", "--add-path", "Package.resolved",
+    );
+
+    assert.equal(updated.status, 2);
+    assert.match(updated.stderr, /Cannot update path claims after ASN-0001 is merged/);
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("start binds an assignment to an isolated linked worktree", () => {
   const project = fixture();
   try {
@@ -311,6 +455,60 @@ test("cleanup force-removes clean submodule worktrees and reports every dirty pa
     else process.env.GIT_ALLOW_PROTOCOL = previousAllowedProtocols;
     project.cleanup();
     submodule.cleanup();
+  }
+});
+
+test("cleanup preserves nested Git repositories whose objects exist only inside the worktree", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { path: "**" });
+    const nestedRepository = join(assignment.worktree, "External", "package");
+    mkdirSync(nestedRepository, { recursive: true });
+    git(nestedRepository, "init", "-b", "main");
+    git(nestedRepository, "config", "user.email", "tests@example.invalid");
+    git(nestedRepository, "config", "user.name", "gantt-cli tests");
+    writeFileSync(join(nestedRepository, "package.txt"), "durable only here\n");
+    git(nestedRepository, "add", "package.txt");
+    git(nestedRepository, "commit", "-m", "package commit");
+    writeFileSync(
+      join(assignment.worktree, ".gitmodules"),
+      "[submodule \"External/package\"]\n\tpath = External/package\n\turl = ./External/package\n",
+    );
+    git(assignment.worktree, "add", ".gitmodules", "External/package");
+    git(assignment.worktree, "commit", "-m", "add embedded package repository");
+    const merged = invoke("merge", "--repo", project.repository, "REQ-0001");
+    assert.equal(merged.status, 0, merged.stderr);
+
+    const cleaned = invoke("cleanup", "--repo", project.repository, "REQ-0001");
+
+    assert.equal(cleaned.status, 2);
+    assert.match(cleaned.stderr, /nested Git repositories store data inside it/);
+    assert.match(cleaned.stderr, /External\/package/);
+    assert.equal(readFileSync(join(nestedRepository, "package.txt"), "utf8"), "durable only here\n");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("cleanup preserves ignored bare repositories stored inside the worktree", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { path: "**" });
+    writeFileSync(join(assignment.worktree, ".gitignore"), "External/package.git/\n");
+    git(assignment.worktree, "add", ".gitignore");
+    git(assignment.worktree, "commit", "-m", "ignore local bare repository");
+    const bareRepository = join(assignment.worktree, "External", "package.git");
+    mkdirSync(dirname(bareRepository), { recursive: true });
+    git(dirname(bareRepository), "init", "--bare", bareRepository);
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+
+    const cleaned = invoke("cleanup", "--repo", project.repository, "REQ-0001");
+
+    assert.equal(cleaned.status, 2);
+    assert.match(cleaned.stderr, /External\/package\.git/);
+    assert.match(readFileSync(join(bareRepository, "HEAD"), "utf8"), /refs\/heads/);
+  } finally {
+    project.cleanup();
   }
 });
 
@@ -750,7 +948,7 @@ test("doctor reports retained abandoned worktrees as recoverable warnings", () =
 test("help and agent-instructions expose the complete CLI contract", () => {
   const version = invoke("--version");
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(version.stdout.trim(), "0.1.0-alpha.2");
+  assert.equal(version.stdout.trim(), "0.1.0-alpha.3");
 
   const help = invoke("--help");
   assert.equal(help.status, 0, help.stderr);
@@ -761,6 +959,7 @@ test("help and agent-instructions expose the complete CLI contract", () => {
   const commandHelp = {
     init: "--install-agent-instructions",
     add: "--verify <command>",
+    update: "--add-path <glob>",
     schedule: "--json",
     start: "<requirement-id>",
     repair: "<assignment-id>",
