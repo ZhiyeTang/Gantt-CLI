@@ -103,6 +103,12 @@ npx gantt-cli@latest add \
 
 `add` 会输出生成的 requirement ID。在全新的 registry 中，上面两个命令会创建 `REQ-0001` 和 `REQ-0002`。
 
+如果实现过程中发现 merge 前漏报了路径范围，应通过 CLI 更新声明，而不是直接编辑状态文件：
+
+```bash
+npx gantt-cli@latest update REQ-0001 --add-path .gitmodules --add-path Package.resolved
+```
+
 ### 2. 调度并开始工作
 
 ```bash
@@ -136,6 +142,7 @@ npx gantt-cli@latest repair ASN-0001
 | --- | --- |
 | `init` | 初始化仓库；可选安装 Agent 指引 |
 | `add` | 创建 requirement |
+| `update` | 在 merge 前添加或移除路径声明 |
 | `schedule` | 选择可并行工作并解释阻塞原因 |
 | `start` | 创建 branch、worktree 和 assignment |
 | `merge` | 将 assignment 合并到目标分支 |
@@ -178,6 +185,7 @@ npx gantt-cli@latest agent-instructions
 - 写入使用 lock file 和原子替换，避免多个进程破坏状态。
 - worktree 默认放在相邻的 `.gantt-worktrees/` 目录。
 - `merge` 会在修改主 worktree 前拒绝越界路径，并记录不可变的 source/merge commit 证据。
+- `update` 会把路径声明变更写入事件日志；如果新声明与活动 assignment 冲突，默认拒绝，除非显式使用 `--force`。
 - `cleanup` 会拒绝所有未提交修改，包括递归 submodule 修改；如果嵌套仓库的 Git 数据仅存在于 worktree 内，也会保留 worktree 并拒绝删除。
 - `done` 使用已记录的 commit 检查合并关系和 worktree 清理情况，不要求 assignment branch 继续存在，然后在主 worktree 中运行可选的验证命令。
 - 验证输出和退出码会记录在 assignment 上；验证失败后仍可修复并重试完成操作。

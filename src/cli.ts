@@ -69,6 +69,7 @@ const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; posit
     flags: ["json"],
     positionals: 0,
   },
+  update: { values: ["repo", "add-path", "remove-path"], flags: ["force", "json"], positionals: 1 },
   schedule: { values: ["repo"], flags: ["json"], positionals: 0 },
   start: {
     values: ["repo", "session", "alias", "branch", "worktree-root"], flags: ["force", "json"], positionals: 1,
@@ -302,6 +303,63 @@ function handleAdd(args: ParsedArguments): number {
     return {
       requirement: requirementView(state, requirement),
       message: `Added ${identifier}; run schedule before start.`,
+    };
+  });
+  output(result, args.flags.has("json"));
+  return 0;
+}
+
+function handleUpdate(args: ParsedArguments): number {
+  const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const identifier = args.positionals[0];
+  if (!identifier) throw new ValidationError("update requires a requirement ID.");
+  const requestedPaths = normalizeProjectPaths(args.options.get("add-path") ?? [], false);
+  const removedPaths = normalizeProjectPaths(args.options.get("remove-path") ?? [], false);
+  if (requestedPaths.length === 0 && removedPaths.length === 0) {
+    throw new ValidationError("update requires at least one --add-path or --remove-path.");
+  }
+  const result = registry.locked(() => {
+    const state = registry.read();
+    primaryRepository(state, currentRoot);
+    const requirement = requirementById(state, identifier);
+    if (!["ready", "active", "blocked"].includes(requirement.status)) {
+      throw new ValidationError(`Cannot update path claims for ${requirement.id} while it is ${requirement.status}.`);
+    }
+    const assignment = liveAssignmentForRequirement(state, requirement.id);
+    if (assignment && !["active", "blocked"].includes(assignment.status)) {
+      throw new ValidationError(`Cannot update path claims after ${assignment.id} is ${assignment.status}.`);
+    }
+    const previousPaths = requirement.paths;
+    const paths = normalizeProjectPaths([
+      ...previousPaths.filter((path) => !removedPaths.includes(path)),
+      ...requestedPaths,
+    ]);
+    const conflicts = activeConflicts(state, { ...requirement, paths });
+    if (conflicts.length > 0 && !args.flags.has("force")) {
+      const blockers = conflicts.map((item) => `${item.requirementId}/${item.assignmentId}`).join(", ");
+      throw new ValidationError(
+        `${requirement.id} conflicts with active claims held by ${blockers}. Use --force to override advisory claims.`,
+      );
+    }
+    const addedPaths = paths.filter((path) => !previousPaths.includes(path));
+    const actualRemovedPaths = previousPaths.filter((path) => !paths.includes(path));
+    requirement.paths = paths;
+    requirement.updatedAt = utcNow();
+    appendEvent(state, "requirement.paths_updated", {
+      requirementId: requirement.id,
+      data: {
+        addedPaths,
+        removedPaths: actualRemovedPaths,
+        previousPaths,
+        paths,
+        forced: args.flags.has("force"),
+        conflicts: args.flags.has("force") ? conflicts : [],
+      },
+    });
+    registry.write(state);
+    return {
+      requirement: requirementView(state, requirement),
+      message: `Updated path claims for ${requirement.id}.`,
     };
   });
   output(result, args.flags.has("json"));
@@ -1053,6 +1111,7 @@ function handleDoctor(args: ParsedArguments): number {
 const COMMAND_SUMMARIES: Record<string, string> = {
   init: "Initialize local schema-v3 state.",
   add: "Register a requirement.",
+  update: "Update a requirement's path claims.",
   schedule: "Show stable greedy batches and deferrals.",
   start: "Allocate a branch and linked worktree.",
   repair: "Retry a retained provisioning-failed assignment.",
@@ -1071,6 +1130,7 @@ const COMMAND_SUMMARIES: Record<string, string> = {
 };
 
 const COMMAND_POSITIONALS: Record<string, string> = {
+  update: "<requirement-id>",
   start: "<requirement-id>",
   repair: "<assignment-id>",
   merge: "<requirement-id>",
@@ -1094,6 +1154,8 @@ const OPTION_HELP: Record<string, { usage: string; description: string }> = {
   domains: { usage: "--domains <names...>", description: "One or more logical ownership claims." },
   path: { usage: "--path <glob>", description: "Repository-relative path claim; repeatable." },
   paths: { usage: "--paths <globs...>", description: "One or more repository-relative path claims." },
+  "add-path": { usage: "--add-path <glob>", description: "Add a repository-relative path claim; repeatable." },
+  "remove-path": { usage: "--remove-path <glob>", description: "Remove a repository-relative path claim; repeatable." },
   session: { usage: "--session <id>", description: "Agent session ID; falls back to Codex environment variables." },
   alias: { usage: "--alias <name>", description: "Assignment alias; required." },
   branch: { usage: "--branch <name>", description: "Explicit assignment branch name." },
@@ -1135,6 +1197,7 @@ A requirement control plane and Git-worktree execution orchestrator for coding a
 Commands:
   init                Initialize local schema-v3 state
   add                 Register a requirement
+  update              Update a requirement's path claims
   schedule            Show stable greedy batches and deferrals
   start               Allocate a branch and linked worktree
   repair              Retry a retained provisioning-failed assignment
@@ -1191,6 +1254,7 @@ function main(arguments_ = process.argv.slice(2)): number {
   const handlers: Record<string, (parsed: ParsedArguments) => number> = {
     init: handleInit,
     add: handleAdd,
+    update: handleUpdate,
     schedule: withCommandLock(handleSchedule),
     list: withCommandLock(handleList),
     start: withCommandLock(handleStart),

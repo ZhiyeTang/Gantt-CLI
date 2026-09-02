@@ -103,6 +103,12 @@ npx gantt-cli@latest add \
 
 `add` prints the generated requirement ID. In a new registry, the two commands above create `REQ-0001` and `REQ-0002`.
 
+If implementation reveals missing scope before merge, update the claims through the CLI instead of editing state directly:
+
+```bash
+npx gantt-cli@latest update REQ-0001 --add-path .gitmodules --add-path Package.resolved
+```
+
 ### 2. Schedule and start work
 
 ```bash
@@ -136,6 +142,7 @@ npx gantt-cli@latest repair ASN-0001
 | --- | --- |
 | `init` | Initialize a repository and optionally install agent instructions |
 | `add` | Create a requirement |
+| `update` | Add or remove path claims before merge |
 | `schedule` | Select parallel work and explain blocked requirements |
 | `start` | Create a branch, worktree, and assignment |
 | `merge` | Merge an assignment into the target branch |
@@ -178,6 +185,7 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 - A lock file and atomic replacement protect concurrent writes.
 - Worktrees live in the adjacent `.gantt-worktrees/` directory by default.
 - `merge` rejects out-of-scope paths before changing the primary worktree and records immutable source/merge commit evidence.
+- `update` records path-claim changes in the event log and rejects new active conflicts unless explicitly forced.
 - `cleanup` refuses uncommitted changes, including recursive submodule changes, and preserves nested repositories whose Git data exists only inside the worktree.
 - `done` verifies recorded merge ancestry and worktree cleanup without requiring the assignment branch, then runs the optional verification command in the primary worktree.
 - Verification output and exit status are recorded on the assignment; a failure keeps completion retryable.

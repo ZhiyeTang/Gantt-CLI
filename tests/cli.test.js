@@ -190,6 +190,121 @@ test("add records an optional verification command", () => {
   }
 });
 
+test("update adds path claims so an active assignment can recover from a rejected merge", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    writeFileSync(join(assignment.worktree, ".gitmodules"), "# package metadata\n");
+    writeFileSync(join(assignment.worktree, "Package.resolved"), "{}\n");
+    git(assignment.worktree, "add", ".gitmodules", "Package.resolved");
+    git(assignment.worktree, "commit", "-m", "add package metadata");
+    const rejected = invoke("merge", "--repo", project.repository, "REQ-0001");
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /\.gitmodules, Package\.resolved/);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0001",
+      "--add-path", ".gitmodules", "--add-path", "Package.resolved", "--json",
+    );
+
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/**", ".gitmodules", "Package.resolved"]);
+    const logged = invoke("log", "--repo", project.repository, "--requirement", "REQ-0001", "--json");
+    const event = JSON.parse(logged.stdout).events.at(-1);
+    assert.equal(event.type, "requirement.paths_updated");
+    assert.deepEqual(event.data.addedPaths, [".gitmodules", "Package.resolved"]);
+    assert.equal(invoke("doctor", "--repo", project.repository).status, 0);
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update removes path claims without allowing an empty scope", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository,
+      "--request", "Trim scope", "--path", "src/**", "--path", "docs/**",
+    ).status, 0);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0001", "--remove-path", "docs/**", "--json",
+    );
+
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/**"]);
+    const event = JSON.parse(invoke(
+      "log", "--repo", project.repository, "--requirement", "REQ-0001", "--json",
+    ).stdout).events.at(-1);
+    assert.deepEqual(event.data.removedPaths, ["docs/**"]);
+    const empty = invoke(
+      "update", "--repo", project.repository, "REQ-0001", "--remove-path", "src/**",
+    );
+    assert.equal(empty.status, 2);
+    assert.match(empty.stderr, /At least one --path or --paths claim is required/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update rejects new active claim conflicts unless explicitly forced", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    for (const [request, path] of [["First", "src/first.ts"], ["Second", "src/second.ts"]]) {
+      assert.equal(invoke(
+        "add", "--repo", project.repository, "--request", request, "--path", path,
+      ).status, 0);
+    }
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0001",
+      "--session", "session-one", "--alias", "first",
+    ).status, 0);
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0002",
+      "--session", "session-two", "--alias", "second",
+    ).status, 0);
+
+    const rejected = invoke(
+      "update", "--repo", project.repository, "REQ-0002", "--add-path", "src/first.ts",
+    );
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /conflicts with active claims held by REQ-0001\/ASN-0001/);
+
+    const forced = invoke(
+      "update", "--repo", project.repository, "REQ-0002", "--add-path", "src/first.ts", "--force", "--json",
+    );
+    assert.equal(forced.status, 0, forced.stderr);
+    const event = JSON.parse(invoke(
+      "log", "--repo", project.repository, "--requirement", "REQ-0002", "--json",
+    ).stdout).events.at(-1);
+    assert.equal(event.data.forced, true);
+    assert.equal(event.data.conflicts[0].requirementId, "REQ-0001");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("update rejects path changes after the assignment is merged", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+
+    const updated = invoke(
+      "update", "--repo", project.repository, "REQ-0001", "--add-path", "Package.resolved",
+    );
+
+    assert.equal(updated.status, 2);
+    assert.match(updated.stderr, /Cannot update path claims after ASN-0001 is merged/);
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("start binds an assignment to an isolated linked worktree", () => {
   const project = fixture();
   try {
@@ -793,6 +908,7 @@ test("help and agent-instructions expose the complete CLI contract", () => {
   const commandHelp = {
     init: "--install-agent-instructions",
     add: "--verify <command>",
+    update: "--add-path <glob>",
     schedule: "--json",
     start: "<requirement-id>",
     repair: "<assignment-id>",
