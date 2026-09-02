@@ -461,6 +461,28 @@ test("cleanup preserves nested Git repositories whose objects exist only inside 
   }
 });
 
+test("cleanup preserves ignored bare repositories stored inside the worktree", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { path: "**" });
+    writeFileSync(join(assignment.worktree, ".gitignore"), "External/package.git/\n");
+    git(assignment.worktree, "add", ".gitignore");
+    git(assignment.worktree, "commit", "-m", "ignore local bare repository");
+    const bareRepository = join(assignment.worktree, "External", "package.git");
+    mkdirSync(dirname(bareRepository), { recursive: true });
+    git(dirname(bareRepository), "init", "--bare", bareRepository);
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+
+    const cleaned = invoke("cleanup", "--repo", project.repository, "REQ-0001");
+
+    assert.equal(cleaned.status, 2);
+    assert.match(cleaned.stderr, /External\/package\.git/);
+    assert.match(readFileSync(join(bareRepository, "HEAD"), "utf8"), /refs\/heads/);
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("done and doctor use recorded commits after the merged branch is deleted", () => {
   const project = fixture();
   try {

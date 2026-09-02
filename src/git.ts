@@ -259,7 +259,17 @@ function nestedRepositoriesStoredInside(worktree: string): { repository: string;
   const nested = [];
   while (directories.length > 0) {
     const directory = directories.pop() as string;
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const entries = readdirSync(directory, { withFileTypes: true });
+    const names = new Map(entries.map((entry) => [entry.name, entry]));
+    if (directory !== root && names.get("HEAD")?.isFile()
+      && names.get("objects")?.isDirectory() && names.get("refs")?.isDirectory()) {
+      const bare = runGitResult(directory, ["rev-parse", "--is-bare-repository"]);
+      if (bare.status === 0 && bare.stdout.trim() === "true") {
+        nested.push({ repository: directory, gitDirectory: directory });
+        continue;
+      }
+    }
+    for (const entry of entries) {
       if (entry.name === ".git") {
         if (directory === root) continue;
         const discovered = runGitResult(directory, ["rev-parse", "--absolute-git-dir"]);
