@@ -172,6 +172,82 @@ test("add and schedule preserve stable requirement planning behavior", () => {
   }
 });
 
+test("list groups requirements into operational swimlanes", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    const requirements = [
+      ["Implement authentication", "src/auth/**"],
+      ["Build account UI", "src/ui/**"],
+      ["Polish account UI", "src/ui/profile.ts"],
+      ["Document account UI", "docs/account.md", "REQ-0002"],
+      ["Prepare release", "release/**"],
+    ];
+    for (const [request, path, dependency] of requirements) {
+      const arguments_ = ["add", "--repo", project.repository, "--request", request, "--path", path];
+      if (dependency) arguments_.push("--depends-on", dependency);
+      assert.equal(invoke(...arguments_).status, 0);
+    }
+    assert.equal(invoke(
+      "start", "--repo", project.repository, "REQ-0001",
+      "--session", "session-test", "--alias", "auth-api",
+    ).status, 0);
+    assert.equal(invoke(
+      "block", "--repo", project.repository, "REQ-0005", "--reason", "release window closed",
+    ).status, 0);
+
+    const listed = invoke("list", "--repo", project.repository);
+
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.match(listed.stdout, /^Gantt · 5 requirements/m);
+    assert.match(listed.stdout, /^ACTIVE\s+1$/m);
+    assert.match(listed.stdout, /REQ-0001\s+Implement authentication/);
+    assert.match(listed.stdout, /auth-api · active/);
+    assert.match(listed.stdout, /^NEXT\s+1$/m);
+    assert.match(listed.stdout, /REQ-0002\s+Build account UI/);
+    assert.match(listed.stdout, /^QUEUED\s+1$/m);
+    assert.match(listed.stdout, /REQ-0003\s+Polish account UI/);
+    assert.match(listed.stdout, /batch 1/);
+    assert.match(listed.stdout, /^WAITING\s+1$/m);
+    assert.match(listed.stdout, /REQ-0004\s+Document account UI/);
+    assert.match(listed.stdout, /waits for REQ-0002/);
+    assert.match(listed.stdout, /^BLOCKED\s+1$/m);
+    assert.match(listed.stdout, /REQ-0005\s+Prepare release/);
+    assert.match(listed.stdout, /release window closed/);
+    assert.doesNotMatch(listed.stdout, /\u001b\[/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("list uses semantic colors when enabled and respects NO_COLOR", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository,
+      "--request", "Fix production outage", "--path", "src/**", "--priority", "p0",
+    ).status, 0);
+
+    const colored = spawnSync(process.execPath, [cli, "list", "--repo", project.repository], {
+      encoding: "utf8",
+      env: { ...process.env, FORCE_COLOR: "1", NO_COLOR: "" },
+    });
+    const plain = spawnSync(process.execPath, [cli, "list", "--repo", project.repository], {
+      encoding: "utf8",
+      env: { ...process.env, FORCE_COLOR: "1", NO_COLOR: "1" },
+    });
+
+    assert.equal(colored.status, 0, colored.stderr);
+    assert.match(colored.stdout, /\u001b\[36m/);
+    assert.match(colored.stdout, /\u001b\[31m/);
+    assert.equal(plain.status, 0, plain.stderr);
+    assert.doesNotMatch(plain.stdout, /\u001b\[/);
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("add records an optional verification command", () => {
   const project = fixture();
   try {

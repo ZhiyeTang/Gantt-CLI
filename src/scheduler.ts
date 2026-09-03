@@ -1,3 +1,5 @@
+import pc from "picocolors";
+
 import {
   PRIORITY_ORDER,
   activeAssignments,
@@ -21,6 +23,24 @@ export interface Schedule {
   deferred: Record<string, unknown>[];
   decisions: Record<string, Record<string, unknown>>;
 }
+
+type ListLane = "ACTIVE" | "NEXT" | "QUEUED" | "WAITING" | "BLOCKED" | "CLOSED";
+
+interface ListItem {
+  requirement: Requirement;
+  marker: string;
+  detail: string;
+}
+
+const LIST_LANES: ListLane[] = ["ACTIVE", "NEXT", "QUEUED", "WAITING", "BLOCKED", "CLOSED"];
+const LANE_STYLES: Record<ListLane, (value: string) => string> = {
+  ACTIVE: pc.green,
+  NEXT: pc.cyan,
+  QUEUED: pc.blue,
+  WAITING: pc.yellow,
+  BLOCKED: pc.red,
+  CLOSED: pc.gray,
+};
 
 function scopePrefix(claim: string): string {
   const positions = [..."*?["].map((marker) => claim.indexOf(marker)).filter((index) => index >= 0);
@@ -225,6 +245,74 @@ export function renderSchedule(state: State): string {
   if (inactive.length > 0) {
     lines.push("", "Not scheduled");
     for (const requirement of inactive) lines.push(`${requirement.id}: ${requirement.status}`);
+  }
+  return lines.join("\n");
+}
+
+function styledPriority(priority: string): string {
+  if (priority === "p0") return pc.bold(pc.red(priority));
+  if (priority === "p1") return pc.yellow(priority);
+  if (priority === "p2") return pc.cyan(priority);
+  return pc.gray(priority);
+}
+
+function waitingDetail(decision: Record<string, unknown>): string {
+  if (decision.reason === "dependencies" && Array.isArray(decision.dependencies)) {
+    return `waits for ${decision.dependencies.join(", ")}`;
+  }
+  if (decision.reason === "active_claims" && Array.isArray(decision.conflicts)) {
+    const blockers = (decision.conflicts as Conflict[])
+      .map((conflict) => `${conflict.requirementId}/${conflict.assignmentId}`).join(", ");
+    return `conflicts with active ${blockers}`;
+  }
+  return "waiting";
+}
+
+export function renderList(state: State): string {
+  if (state.requirements.length === 0) return "No requirements registered.";
+  const schedule = buildSchedule(state);
+  const lanes: Record<ListLane, ListItem[]> = {
+    ACTIVE: [], NEXT: [], QUEUED: [], WAITING: [], BLOCKED: [], CLOSED: [],
+  };
+
+  for (const requirement of state.requirements) {
+    const assignment = liveAssignmentForRequirement(state, requirement.id);
+    const decision = schedule.decisions[requirement.id];
+    if (requirement.status === "active") {
+      lanes.ACTIVE.push({
+        requirement,
+        marker: "▶",
+        detail: assignment ? `${assignment.alias} · ${assignment.status}` : "active",
+      });
+    } else if (requirement.status === "blocked") {
+      const reason = typeof requirement.blockedReason === "string" ? requirement.blockedReason : "blocked";
+      lanes.BLOCKED.push({ requirement, marker: "!", detail: reason });
+    } else if (requirement.status === "ready" && decision?.kind === "batch") {
+      const batch = Number(decision.batch);
+      const lane = batch === 0 ? "NEXT" : "QUEUED";
+      lanes[lane].push({ requirement, marker: batch === 0 ? "●" : "○", detail: `batch ${batch}` });
+    } else if (requirement.status === "ready" && decision?.kind === "deferred") {
+      lanes.WAITING.push({ requirement, marker: "◌", detail: waitingDetail(decision) });
+    } else {
+      const reason = typeof requirement.deprecationReason === "string" ? ` · ${requirement.deprecationReason}` : "";
+      lanes.CLOSED.push({
+        requirement,
+        marker: requirement.status === "done" ? "✓" : "×",
+        detail: `${requirement.status}${reason}`,
+      });
+    }
+  }
+
+  const lines = [`Gantt · ${state.requirements.length} requirements`];
+  for (const lane of LIST_LANES) {
+    const items = lanes[lane];
+    if (items.length === 0) continue;
+    const style = LANE_STYLES[lane];
+    lines.push("", pc.bold(style(`${lane.padEnd(8)} ${items.length}`)));
+    for (const item of items) {
+      lines.push(`  ${style(item.marker)} ${pc.bold(item.requirement.id)}  ${item.requirement.request}`);
+      lines.push(`    ${styledPriority(item.requirement.priority)} · ${item.requirement.points}pt · ${pc.dim(item.detail)}`);
+    }
   }
   return lines.join("\n");
 }
