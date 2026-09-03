@@ -65,7 +65,7 @@ interface ParsedArguments {
   flags: Set<string>;
 }
 
-const BOOLEAN_OPTIONS = new Set(["json", "force", "help", "install-agent-instructions", "prepare"]);
+const BOOLEAN_OPTIONS = new Set(["json", "force", "help", "install-agent-instructions", "prepare", "all"]);
 const VARIADIC_OPTIONS = new Set(["paths", "domains"]);
 const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; positionals: number }> = {
   init: { values: ["repo"], flags: ["install-agent-instructions"], positionals: 0 },
@@ -90,7 +90,7 @@ const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; posit
   deprecate: { values: ["repo", "reason"], flags: ["json"], positionals: 1 },
   archive: { values: ["repo", "summary-file", "fingerprint"], flags: ["prepare", "json"], positionals: 0 },
   phase: { values: ["repo"], flags: ["json"], positionals: 2 },
-  list: { values: ["repo"], flags: ["json"], positionals: 0 },
+  list: { values: ["repo"], flags: ["json", "all"], positionals: 0 },
   show: { values: ["repo"], flags: ["json"], positionals: 1 },
   doctor: { values: ["repo"], flags: ["json"], positionals: 0 },
   log: { values: ["repo", "requirement", "assignment", "limit"], flags: ["json"], positionals: 0 },
@@ -393,7 +393,7 @@ function handleList(args: ParsedArguments): number {
   if (args.flags.has("json")) {
     output({ requirements: state.requirements.map((requirement) => requirementView(state, requirement, schedule)) }, true);
   } else {
-    process.stdout.write(`${renderList(state)}\n`);
+    process.stdout.write(`${renderList(state, args.flags.has("all"))}\n`);
   }
   return 0;
 }
@@ -1511,6 +1511,7 @@ const OPTION_HELP: Record<string, { usage: string; description: string }> = {
   json: { usage: "--json", description: "Print machine-readable JSON." },
   force: { usage: "--force", description: "Override advisory active-claim conflicts." },
   prepare: { usage: "--prepare", description: "Return the immutable commit manifest for Agent summarization." },
+  all: { usage: "--all", description: "Include closed requirements in the table." },
   "install-agent-instructions": {
     usage: "--install-agent-instructions",
     description: "Add or update the managed AGENTS.md pointer.",
