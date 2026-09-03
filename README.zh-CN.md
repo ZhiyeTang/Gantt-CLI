@@ -66,10 +66,11 @@ Agent 会退出，终端会关闭，上下文会丢失。Gantt-CLI 把 requireme
 
 ## 工作方式
 
-Gantt-CLI 管理两个核心对象：
+Gantt-CLI 管理三个核心对象：
 
 - **Requirement**：要交付的结果，包括范围、依赖、验证命令和状态。
 - **Assignment**：一次实际执行，包括 branch、worktree、base commit、source commit 和 merge commit。
+- **Phase**：一个不可变的长期归档，包含当前规划范围内的全部 requirement，以及 Agent 根据 Git 历史生成的摘要。
 
 Requirement 通常按以下生命周期流转：
 
@@ -78,6 +79,9 @@ ready -> active -> done
   |        |
   v        v
 blocked  blocked
+  |
+  v
+deprecated
 ```
 
 解除阻塞后，requirement 会回到 `ready` 或 `active`。验证失败时，它会保持 `active`，assignment 保持 `cleaned`；修复问题后可重新运行 `done`。
@@ -136,6 +140,24 @@ npx gantt-cli@latest repair ASN-0001
 
 `repair` 会验证保留的 branch/worktree 绑定，然后重试递归 submodule 初始化。
 
+### 4. 归档 Phase
+
+归档由用户显式触发，并且是全有或全无的操作。当前所有 requirement 必须为 `done` 或 `deprecated`，且不能遗留 assignment worktree。首先让 gantt-cli 生成不可变的 commit manifest：
+
+```bash
+npx gantt-cli@latest archive --prepare --json
+```
+
+Agent 根据返回的 Git 证据编写 Markdown 摘要，再使用同一个指纹完成归档：
+
+```bash
+npx gantt-cli@latest archive \
+  --fingerprint <prepare-返回的-sha256> \
+  --summary-file phase-summary.md
+```
+
+归档结果是不可变的 `PHASE-001`。当前 requirement、assignment 和 event 的编号会从初始值重新开始；历史 ID 使用 `PHASE-001/REQ-0001` 这样的完整引用保持唯一。
+
 ## 命令参考
 
 | 命令 | 用途 |
@@ -149,7 +171,11 @@ npx gantt-cli@latest repair ASN-0001
 | `cleanup` | 删除干净且已合并 assignment 的 worktree |
 | `done` | 验证交付事实并完成 requirement |
 | `block` / `unblock` | 标记或解除人工阻塞 |
-| `abandon` | 放弃 assignment，但保留 requirement |
+| `release` | 释放 assignment，但保留 requirement 和 worktree |
+| `discard` | 删除 released assignment 保留的干净 worktree |
+| `deprecate` | 永久终止不会交付的 requirement |
+| `archive` | 将全部终态 requirement 归档为不可变 Phase |
+| `phase` | 列出或查看 Phase 归档 |
 | `repair` | 对保留的 provisioning-failed assignment 重试 submodule 初始化 |
 | `list` / `show` | 查看 requirement 和 assignment |
 | `doctor` | 检查仓库、状态文件和 worktree 一致性 |
@@ -187,9 +213,12 @@ npx gantt-cli@latest agent-instructions
 - `merge` 会在修改主 worktree 前拒绝越界路径，并记录不可变的 source/merge commit 证据。
 - `update` 会把路径声明变更写入事件日志；如果新声明与活动 assignment 冲突，默认拒绝，除非显式使用 `--force`。
 - `cleanup` 会拒绝所有未提交修改，包括递归 submodule 修改；如果嵌套仓库的 Git 数据仅存在于 worktree 内，也会保留 worktree 并拒绝删除。
+- `release` 会保留中断的工作；`discard` 删除 worktree 前采用与 `cleanup` 相同的干净状态和嵌套仓库保护。
 - `done` 使用已记录的 commit 检查合并关系和 worktree 清理情况，不要求 assignment branch 继续存在，然后在主 worktree 中运行可选的验证命令。
 - 验证输出和退出码会记录在 assignment 上；验证失败后仍可修复并重试完成操作。
 - `repair` 会先验证当前 Git 事实，再重试保留的 provisioning failure。
+- Phase 数据位于 `.git/gantt-cli/phases/PHASE-xxx/`；`doctor` 会使用活动状态中记录的哈希验证归档 JSON 和摘要。
+- schema-v3 registry 会自动迁移：`cancelled` requirement 变为 `deprecated`，`abandoned` assignment 变为 `released`。
 
 ## 要求与边界
 

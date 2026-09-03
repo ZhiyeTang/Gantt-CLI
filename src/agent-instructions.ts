@@ -24,7 +24,11 @@ When a user introduces an implementation requirement:
 4. Run \`npx gantt-cli@next start REQ-XXXX --session <current-session-id> --alias <name> --json\`, then edit only the returned worktree.
 5. Commit there, then run \`npx gantt-cli@next merge REQ-XXXX\` → \`npx gantt-cli@next cleanup REQ-XXXX\` → \`npx gantt-cli@next done REQ-XXXX\` from the primary worktree.
 6. Do not add commits to an assignment after merge without running merge again. Once no worktree checks out its branch, the branch may be retained or deleted; cleanup never deletes it automatically, and done uses the recorded commits.
-7. Use \`block\`, \`unblock\`, and \`abandon\` for interruptions; use \`repair\` for retained provisioning failures and \`doctor\` for consistency checks.
+7. Use \`block\` and \`unblock\` for temporary blockers. Use \`release\` to return an interrupted Requirement to \`ready\`; recover its retained work or run \`discard <assignment-id>\` once the worktree is clean.
+8. Use \`deprecate REQ-XXXX --reason <reason>\` only when the Requirement will never be delivered. Resolve non-terminal dependents and retained worktrees first.
+9. Use \`repair\` for retained provisioning failures and \`doctor\` for consistency checks.
+
+Phase archival is user-triggered, never automatic. When the user asks to archive and every current Requirement is \`done\` or \`deprecated\`, run \`archive --prepare --json\`, inspect the listed commit history, write a non-empty Markdown summary, then finalize with the returned fingerprint and \`--summary-file\`. Historical Phase data is immutable.
 
 Completion criterion: the Requirement status is \`done\`; a commit or chat claim alone is incomplete.
 `;

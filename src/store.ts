@@ -16,18 +16,21 @@ import { dirname, join } from "node:path";
 import { RegistryError } from "./errors.js";
 import type { State } from "./models.js";
 import { initialState, normalizeState, utcNow } from "./models.js";
+import { PhaseStore } from "./phases.js";
 
 export class Registry {
   readonly directory: string;
   readonly path: string;
   readonly legacyPath: string;
   readonly lockDirectory: string;
+  readonly phases: PhaseStore;
 
   constructor(commonGitDirectory: string) {
     this.directory = join(commonGitDirectory, "gantt-cli");
     this.path = join(this.directory, "state.json");
     this.legacyPath = join(this.directory, "registry.json");
     this.lockDirectory = join(this.directory, "state.lock.d");
+    this.phases = new PhaseStore(this.directory);
   }
 
   initialize(repositoryRoot: string, commonGitDirectory: string): { state: State; created: boolean } {

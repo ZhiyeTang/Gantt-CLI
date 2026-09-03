@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-import { GanttCliError, GitError, ValidationError } from "./errors.js";
+import { GanttCliError, GitError, RegistryError, ValidationError } from "./errors.js";
 import { AGENT_INSTRUCTIONS, installAgentInstructions } from "./agent-instructions.js";
 import {
   commonGitDir,
@@ -37,13 +37,17 @@ import {
   normalizePriority,
   normalizeProjectPaths,
   normalizeRequirementIds,
+  normalizePhaseId,
+  nextPhaseId,
   requirementById,
   utcNow,
   validatePoints,
   type Requirement,
   type Assignment,
+  type Phase,
   type State,
 } from "./models.js";
+import { phaseArchive, phaseFingerprint } from "./phases.js";
 import {
   activeConflicts,
   buildSchedule,
@@ -60,7 +64,7 @@ interface ParsedArguments {
   flags: Set<string>;
 }
 
-const BOOLEAN_OPTIONS = new Set(["json", "force", "help", "install-agent-instructions"]);
+const BOOLEAN_OPTIONS = new Set(["json", "force", "help", "install-agent-instructions", "prepare"]);
 const VARIADIC_OPTIONS = new Set(["paths", "domains"]);
 const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; positionals: number }> = {
   init: { values: ["repo"], flags: ["install-agent-instructions"], positionals: 0 },
@@ -80,7 +84,11 @@ const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; posit
   done: { values: ["repo"], flags: ["json"], positionals: 1 },
   block: { values: ["repo", "reason"], flags: [], positionals: 1 },
   unblock: { values: ["repo"], flags: [], positionals: 1 },
-  abandon: { values: ["repo", "reason"], flags: [], positionals: 1 },
+  release: { values: ["repo", "reason"], flags: ["json"], positionals: 1 },
+  discard: { values: ["repo"], flags: ["json"], positionals: 1 },
+  deprecate: { values: ["repo", "reason"], flags: ["json"], positionals: 1 },
+  archive: { values: ["repo", "summary-file", "fingerprint"], flags: ["prepare", "json"], positionals: 0 },
+  phase: { values: ["repo"], flags: ["json"], positionals: 2 },
   list: { values: ["repo"], flags: ["json"], positionals: 0 },
   show: { values: ["repo"], flags: ["json"], positionals: 1 },
   doctor: { values: ["repo"], flags: ["json"], positionals: 0 },
@@ -421,7 +429,8 @@ function handleStart(args: ParsedArguments): number {
 
   const assignmentId = `ASN-${String(state.nextAssignmentNumber).padStart(4, "0")}`;
   const slug = slugify(alias);
-  const branch = option(args, "branch") ?? `codex/${requirement.id.toLowerCase()}-${slug}-${assignmentId.toLowerCase()}`;
+  const branch = option(args, "branch")
+    ?? `codex/${nextPhaseId(state).toLowerCase()}-${requirement.id.toLowerCase()}-${slug}-${assignmentId.toLowerCase()}`;
   const worktreeRoot = resolve(option(args, "worktree-root") ?? defaultWorktreeRoot(primary));
   const worktree = resolve(worktreeRoot, `${assignmentId.toLowerCase()}-${slug}`);
   ensureOutsideRepository(worktree, primary);
@@ -872,7 +881,7 @@ function handleUnblock(args: ParsedArguments): number {
   return 0;
 }
 
-function handleAbandon(args: ParsedArguments): number {
+function handleRelease(args: ParsedArguments): number {
   const { registry } = registryFor(option(args, "repo", ".") ?? ".");
   const identifier = requiredRequirementId(args);
   const reason = option(args, "reason", "")?.trim() ?? "";
@@ -883,15 +892,15 @@ function handleAbandon(args: ParsedArguments): number {
     if (!["active", "blocked"].includes(requirement.status)
       || !["active", "blocked"].includes(assignment.status)) {
       throw new ValidationError(
-        "Only an active or blocked assignment can be abandoned; merged work must use cleanup/done.",
+        "Only an active or blocked assignment can be released; merged work must use cleanup/done.",
       );
     }
-    updateAssignment(assignment, "abandoned");
-    assignment.abandonedAt = utcNow();
-    if (reason) assignment.abandonReason = reason;
+    updateAssignment(assignment, "released");
+    assignment.releasedAt = utcNow();
+    if (reason) assignment.releaseReason = reason;
     updateRequirement(requirement, "ready");
     delete requirement.blockedReason;
-    appendEvent(state, "assignment.abandoned", {
+    appendEvent(state, "assignment.released", {
       requirementId: requirement.id,
       assignmentId: assignment.id,
       data: { reason, worktreeRetained: assignment.worktree },
@@ -899,10 +908,105 @@ function handleAbandon(args: ParsedArguments): number {
     registry.write(state);
     return { assignment, requirement };
   });
-  process.stdout.write(
-    `Abandoned ${result.assignment.id}; ${result.requirement.id} is ready for reassignment. `
-    + `Worktree retained: ${result.assignment.worktree}\n`,
-  );
+  output({
+    ...result,
+    nextAction: "discard_or_recover_worktree",
+    message: `Released ${result.assignment.id}; ${result.requirement.id} is ready for reassignment. Worktree retained: ${result.assignment.worktree}`,
+  }, args.flags.has("json"));
+  return 0;
+}
+
+function handleDiscard(args: ParsedArguments): number {
+  const assignmentId = args.positionals[0];
+  if (!assignmentId) throw new ValidationError("discard requires an assignment ID.");
+  const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const result = registry.locked(() => {
+    const state = registry.read();
+    const primary = primaryRepository(state, currentRoot);
+    const assignment = assignmentById(state, assignmentId);
+    if (assignment.status === "discarded") {
+      return { assignment, recovered: false, message: `${assignment.id} worktree is already discarded.` };
+    }
+    if (!["released", "provisioning_failed"].includes(assignment.status)) {
+      throw new ValidationError(`${assignment.id} is ${assignment.status}, not released or provisioning_failed.`);
+    }
+    const requirement = requirementById(state, assignment.requirementId);
+    const record = registeredWorktree(primary, assignment.worktree);
+    const pathExists = existsSync(assignment.worktree);
+    let recovered = false;
+    if (!record) {
+      if (pathExists) {
+        throw new GitError(`Assignment worktree exists but is not registered: ${assignment.worktree}`);
+      }
+      recovered = true;
+    } else {
+      verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
+      removeWorktree(primary, assignment.worktree);
+    }
+    if (!assignment.releasedAt) assignment.releasedAt = utcNow();
+    updateAssignment(assignment, "discarded");
+    assignment.discardedAt = utcNow();
+    appendEvent(state, recovered ? "assignment.discard_recovered" : "assignment.discarded", {
+      requirementId: requirement.id,
+      assignmentId: assignment.id,
+      data: { worktree: assignment.worktree, branchRetained: assignment.branch },
+    });
+    registry.write(state);
+    return {
+      assignment,
+      recovered,
+      message: recovered
+        ? `Recorded already-absent worktree for ${assignment.id} as discarded.`
+        : `Discarded worktree ${assignment.worktree}; branch ${assignment.branch} was retained.`,
+    };
+  });
+  output(result, args.flags.has("json"));
+  return 0;
+}
+
+function handleDeprecate(args: ParsedArguments): number {
+  const identifier = requiredRequirementId(args);
+  const reason = requiredOption(args, "reason");
+  const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const result = registry.locked(() => {
+    const state = registry.read();
+    const primary = primaryRepository(state, currentRoot);
+    const requirement = requirementById(state, identifier);
+    if (!["ready", "blocked"].includes(requirement.status)) {
+      throw new ValidationError(`${requirement.id} is ${requirement.status}; release active work before deprecating it.`);
+    }
+    const liveAssignment = liveAssignmentForRequirement(state, requirement.id);
+    if (liveAssignment) {
+      throw new ValidationError(`${requirement.id} still has live assignment ${liveAssignment.id}; release it first.`);
+    }
+    const retained = assignmentsForRequirement(state, requirement.id).filter(
+      (assignment) => registeredWorktree(primary, assignment.worktree) || existsSync(assignment.worktree),
+    );
+    if (retained.length > 0) {
+      throw new ValidationError(
+        `${requirement.id} still has retained worktrees for ${retained.map((assignment) => assignment.id).join(", ")}; discard them first.`,
+      );
+    }
+    const dependents = state.requirements.filter((candidate) => candidate.id !== requirement.id
+      && !["done", "deprecated"].includes(candidate.status)
+      && candidate.dependsOn.includes(requirement.id));
+    if (dependents.length > 0) {
+      throw new ValidationError(
+        `${requirement.id} is still required by non-terminal requirements: ${dependents.map((candidate) => candidate.id).join(", ")}.`,
+      );
+    }
+    updateRequirement(requirement, "deprecated");
+    requirement.deprecatedAt = utcNow();
+    requirement.deprecationReason = reason;
+    delete requirement.blockedReason;
+    appendEvent(state, "requirement.deprecated", {
+      requirementId: requirement.id,
+      data: { reason },
+    });
+    registry.write(state);
+    return { requirement, message: `Deprecated ${requirement.id}.` };
+  });
+  output(result, args.flags.has("json"));
   return 0;
 }
 
@@ -911,6 +1015,20 @@ function handleShow(args: ParsedArguments): number {
   const identifier = requiredRequirementId(args);
   const result = registry.locked(() => {
     const state = registry.read();
+    if (identifier.includes("/")) {
+      const parts = identifier.toUpperCase().split("/");
+      if (parts.length !== 2) throw new ValidationError(`Invalid archived requirement reference: ${identifier}`);
+      const [rawPhaseId, requirementId] = parts as [string, string];
+      const phase = phaseById(state, rawPhaseId);
+      const artifacts = verifiedPhaseArtifacts(registry, phase);
+      const requirement = artifacts.archive.requirements.find((candidate) => candidate.id === requirementId);
+      if (!requirement) throw new ValidationError(`Unknown archived requirement: ${identifier}`);
+      return {
+        ...requirement,
+        phaseId: phase.id,
+        assignments: artifacts.archive.assignments.filter((assignment) => assignment.requirementId === requirement.id),
+      };
+    }
     const requirement = requirementById(state, identifier);
     return {
       ...requirementView(state, requirement),
@@ -977,6 +1095,183 @@ function handleLog(args: ParsedArguments): number {
   return 0;
 }
 
+const PHASE_SUMMARY_GUIDANCE = `Generate a concise Markdown phase summary from the recorded Git evidence.
+Describe merged commits as delivered work. For deprecated requirements, record the request and deprecation reason without
+presenting released or unmerged commits as delivered. Prefer these sections: Delivered, Deprecated, Verification, Notable commits.`;
+
+function archiveReadiness(state: State, primary: string): void {
+  if (state.requirements.length === 0) throw new ValidationError("There are no requirements to archive.");
+  const blockers = state.requirements.filter((requirement) => !["done", "deprecated"].includes(requirement.status));
+  if (blockers.length > 0) {
+    throw new ValidationError([
+      "Cannot archive while requirements are non-terminal:",
+      ...blockers.map((requirement) => `- ${requirement.id} is ${requirement.status}`),
+    ].join("\n"));
+  }
+  const retained = state.assignments.filter(
+    (assignment) => registeredWorktree(primary, assignment.worktree) || existsSync(assignment.worktree),
+  );
+  if (retained.length > 0) {
+    throw new ValidationError([
+      "Cannot archive while assignment worktrees are retained:",
+      ...retained.map((assignment) => `- ${assignment.id}: ${assignment.worktree}`),
+    ].join("\n"));
+  }
+  for (const requirement of state.requirements.filter((candidate) => candidate.status === "done")) {
+    const completed = assignmentsForRequirement(state, requirement.id).filter((assignment) => assignment.status === "completed");
+    if (completed.length !== 1) {
+      throw new GitError(`${requirement.id} must have exactly one completed assignment before archival.`);
+    }
+    verifiedMergeEvidence(primary, completed[0] as Assignment);
+  }
+}
+
+function phaseManifest(state: State, phaseId: string, fingerprint: string): object {
+  return {
+    phaseId,
+    fingerprint,
+    requirements: state.requirements.map((requirement) => ({
+      ...requirement,
+      assignments: assignmentsForRequirement(state, requirement.id),
+    })),
+    guidance: PHASE_SUMMARY_GUIDANCE,
+  };
+}
+
+function summaryContents(path: string): string {
+  try {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new ValidationError(`Phase summary must be a regular file: ${path}`);
+    }
+    const contents = readFileSync(path, "utf8");
+    if (!contents.trim()) throw new ValidationError("Phase summary must contain non-whitespace Markdown.");
+    return contents;
+  } catch (error) {
+    if (error instanceof ValidationError) throw error;
+    throw new ValidationError(`Could not read phase summary ${path}: ${(error as Error).message}`);
+  }
+}
+
+function handleArchive(args: ParsedArguments): number {
+  const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const preparing = args.flags.has("prepare");
+  if (preparing && (option(args, "summary-file") || option(args, "fingerprint"))) {
+    throw new ValidationError("--prepare cannot be combined with --summary-file or --fingerprint.");
+  }
+  if (!preparing && (!option(args, "summary-file") || !option(args, "fingerprint"))) {
+    throw new ValidationError("archive requires --prepare, or both --summary-file and --fingerprint.");
+  }
+  return registry.locked(() => {
+    const state = registry.read();
+    const primary = primaryRepository(state, currentRoot);
+    archiveReadiness(state, primary);
+    const phaseId = nextPhaseId(state);
+    const fingerprint = phaseFingerprint(state, phaseId);
+    if (preparing) {
+      output({
+        ...phaseManifest(state, phaseId, fingerprint),
+        nextAction: "write_phase_summary",
+        message: `Prepared ${phaseId}; generate a summary, then rerun archive with --fingerprint ${fingerprint} --summary-file <path>.`,
+      }, args.flags.has("json"));
+      return 0;
+    }
+    const suppliedFingerprint = requiredOption(args, "fingerprint").toLowerCase();
+    if (suppliedFingerprint !== fingerprint) {
+      throw new ValidationError(
+        `Archive fingerprint changed: expected ${suppliedFingerprint}, current ${fingerprint}. Run archive --prepare again.`,
+      );
+    }
+    const summaryPath = resolve(requiredOption(args, "summary-file"));
+    const summary = summaryContents(summaryPath);
+    const archivedAt = utcNow();
+    const archive = phaseArchive(state, phaseId, archivedAt, fingerprint);
+    const artifacts = registry.phases.write(archive, summary);
+    const phase: Phase = {
+      id: phaseId,
+      archivedAt: artifacts.archive.archivedAt,
+      requirementCount: state.requirements.length,
+      assignmentCount: state.assignments.length,
+      eventCount: state.events.length,
+      fingerprint,
+      archiveHash: artifacts.archiveHash,
+      summaryHash: artifacts.summaryHash,
+    };
+    state.phases.push(phase);
+    state.nextPhaseNumber += 1;
+    state.requirements = [];
+    state.assignments = [];
+    state.events = [];
+    state.nextRequirementNumber = 1;
+    state.nextAssignmentNumber = 1;
+    state.nextEventNumber = 1;
+    appendEvent(state, "phase.archived", {
+      data: {
+        phaseId,
+        fingerprint,
+        requirementCount: phase.requirementCount,
+        assignmentCount: phase.assignmentCount,
+        eventCount: phase.eventCount,
+      },
+    });
+    registry.write(state);
+    output({
+      phase,
+      recoveredArtifacts: artifacts.recovered,
+      message: `Archived all current requirements as ${phaseId}; active IDs restarted.`,
+    }, args.flags.has("json"));
+    return 0;
+  });
+}
+
+function phaseById(state: State, rawId: string): Phase {
+  const phaseId = normalizePhaseId(rawId);
+  const phase = state.phases.find((candidate) => candidate.id === phaseId);
+  if (!phase) throw new ValidationError(`Unknown phase: ${rawId}`);
+  return phase;
+}
+
+function verifiedPhaseArtifacts(registry: Registry, phase: Phase) {
+  const artifacts = registry.phases.read(phase.id);
+  const archive = artifacts.archive;
+  const computedFingerprint = phaseFingerprint(archive, phase.id);
+  if (artifacts.archiveHash !== phase.archiveHash || artifacts.summaryHash !== phase.summaryHash
+    || archive.fingerprint !== phase.fingerprint || computedFingerprint !== phase.fingerprint
+    || archive.archivedAt !== phase.archivedAt) {
+    throw new RegistryError(`${phase.id} content does not match its recorded metadata or hashes.`);
+  }
+  if (archive.requirements.length !== phase.requirementCount
+    || archive.assignments.length !== phase.assignmentCount || archive.events.length !== phase.eventCount) {
+    throw new RegistryError(`${phase.id} content does not match its recorded counts.`);
+  }
+  return artifacts;
+}
+
+function handlePhase(args: ParsedArguments): number {
+  const action = args.positionals[0]?.toLowerCase();
+  const rawId = args.positionals[1];
+  const { registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const state = registry.read();
+  if (action === "list") {
+    if (rawId) throw new ValidationError("phase list does not accept a phase ID.");
+    if (args.flags.has("json")) output({ phases: state.phases }, true);
+    else if (state.phases.length === 0) process.stdout.write("No archived phases.\n");
+    else for (const phase of state.phases) {
+      process.stdout.write(`${phase.id}  ${phase.archivedAt}  ${phase.requirementCount} requirements\n`);
+    }
+    return 0;
+  }
+  if (action === "show") {
+    if (!rawId) throw new ValidationError("phase show requires a phase ID.");
+    const phase = phaseById(state, rawId);
+    const artifacts = verifiedPhaseArtifacts(registry, phase);
+    if (args.flags.has("json")) output({ phase, summary: artifacts.summary, archive: artifacts.archive }, true);
+    else process.stdout.write(artifacts.summary);
+    return 0;
+  }
+  throw new ValidationError("phase requires `list` or `show <phase-id>`.");
+}
+
 interface DoctorIssue {
   severity: "error" | "warning";
   code: string;
@@ -985,7 +1280,7 @@ interface DoctorIssue {
   assignmentId?: string;
 }
 
-function doctorIssues(currentRoot: string, state: State): DoctorIssue[] {
+function doctorIssues(currentRoot: string, state: State, registry: Registry): DoctorIssue[] {
   const issues: DoctorIssue[] = [];
   let primary: string | undefined;
   try {
@@ -1070,10 +1365,28 @@ function doctorIssues(currentRoot: string, state: State): DoctorIssue[] {
         message: typeof assignment.provisionError === "string"
           ? assignment.provisionError : "Repair or remove the retained worktree before retrying.",
       });
-    } else if (status === "abandoned" && record) {
+    } else if (status === "released") {
+      if (record) {
+        try {
+          verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, expectedCommonDirectory);
+          issues.push({
+            severity: "warning", code: "released_worktree", assignmentId: assignment.id,
+            message: "Released worktree was retained for recovery or discard.",
+          });
+        } catch (error) {
+          if (!(error instanceof GanttCliError)) throw error;
+          issues.push({ severity: "error", code: "assignment_binding", assignmentId: assignment.id, message: error.message });
+        }
+      } else if (existsSync(assignment.worktree)) {
+        issues.push({
+          severity: "error", code: "assignment_binding", assignmentId: assignment.id,
+          message: `Released worktree exists but is not registered: ${assignment.worktree}`,
+        });
+      }
+    } else if (status === "discarded" && (record || existsSync(assignment.worktree))) {
       issues.push({
-        severity: "warning", code: "abandoned_worktree", assignmentId: assignment.id,
-        message: "Abandoned worktree was retained for recovery.",
+        severity: "error", code: "discard_incomplete", assignmentId: assignment.id,
+        message: "Discarded assignment still has a worktree.",
       });
     } else if (status === "legacy") {
       issues.push({
@@ -1090,12 +1403,28 @@ function doctorIssues(currentRoot: string, state: State): DoctorIssue[] {
       }
     }
   }
+  const indexedPhases = new Set(state.phases.map((phase) => phase.id));
+  for (const phase of state.phases) {
+    try {
+      verifiedPhaseArtifacts(registry, phase);
+    } catch (error) {
+      if (!(error instanceof GanttCliError)) throw error;
+      issues.push({ severity: "error", code: "phase_integrity", message: `${phase.id}: ${error.message}` });
+    }
+  }
+  for (const phaseId of registry.phases.directoryIds()) {
+    if (!indexedPhases.has(phaseId)) {
+      issues.push({
+        severity: "warning", code: "unindexed_phase", message: `${phaseId} exists on disk but is not indexed by state.json.`,
+      });
+    }
+  }
   return issues;
 }
 
 function handleDoctor(args: ParsedArguments): number {
   const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
-  const issues = registry.locked(() => doctorIssues(currentRoot, registry.read()));
+  const issues = registry.locked(() => doctorIssues(currentRoot, registry.read(), registry));
   const result = { ok: !issues.some((issue) => issue.severity === "error"), issues };
   if (args.flags.has("json")) {
     output(result, true);
@@ -1111,7 +1440,7 @@ function handleDoctor(args: ParsedArguments): number {
 }
 
 const COMMAND_SUMMARIES: Record<string, string> = {
-  init: "Initialize local schema-v3 state.",
+  init: "Initialize local schema-v4 state.",
   add: "Register a requirement.",
   update: "Update a requirement's path claims.",
   schedule: "Show stable greedy batches and deferrals.",
@@ -1122,11 +1451,15 @@ const COMMAND_SUMMARIES: Record<string, string> = {
   done: "Verify and complete a requirement.",
   block: "Block a ready or active requirement.",
   unblock: "Restore a blocked requirement.",
-  abandon: "Release an assignment while retaining its worktree.",
+  release: "Release an assignment while retaining its worktree.",
+  discard: "Remove a retained released assignment worktree.",
+  deprecate: "Permanently deprecate a requirement.",
+  archive: "Archive every terminal requirement into an immutable phase.",
+  phase: "List or inspect immutable phase archives.",
   list: "List requirements and scheduling facts.",
   show: "Show one requirement and assignment history.",
   doctor: "Diagnose state, branch, and worktree drift.",
-  log: "Read the append-only coordination event log.",
+  log: "Read the current phase's append-only coordination event log.",
   stamp: "Append a timestamped requirement note.",
   "agent-instructions": "Print the Agent integration contract.",
 };
@@ -1140,7 +1473,10 @@ const COMMAND_POSITIONALS: Record<string, string> = {
   done: "<requirement-id>",
   block: "<requirement-id>",
   unblock: "<requirement-id>",
-  abandon: "<requirement-id>",
+  release: "<requirement-id>",
+  discard: "<assignment-id>",
+  deprecate: "<requirement-id>",
+  phase: "<list|show> [phase-id]",
   show: "<requirement-id>",
   stamp: "<requirement-id>",
 };
@@ -1169,8 +1505,11 @@ const OPTION_HELP: Record<string, { usage: string; description: string }> = {
   limit: { usage: "--limit <number>", description: "Maximum events to return; defaults to 50." },
   note: { usage: "--note <text>", description: "Timestamped note; required." },
   kind: { usage: "--kind <name>", description: "Note category; defaults to note." },
+  "summary-file": { usage: "--summary-file <path>", description: "Non-empty Markdown summary to store in the phase." },
+  fingerprint: { usage: "--fingerprint <sha256>", description: "State fingerprint returned by archive --prepare." },
   json: { usage: "--json", description: "Print machine-readable JSON." },
   force: { usage: "--force", description: "Override advisory active-claim conflicts." },
+  prepare: { usage: "--prepare", description: "Return the immutable commit manifest for Agent summarization." },
   "install-agent-instructions": {
     usage: "--install-agent-instructions",
     description: "Add or update the managed AGENTS.md pointer.",
@@ -1197,7 +1536,7 @@ const HELP = `Usage: gantt-cli <command> [options]
 A requirement control plane and Git-worktree execution orchestrator for coding agents.
 
 Commands:
-  init                Initialize local schema-v3 state
+  init                Initialize local schema-v4 state
   add                 Register a requirement
   update              Update a requirement's path claims
   schedule            Show stable greedy batches and deferrals
@@ -1208,11 +1547,15 @@ Commands:
   done                Verify and complete a requirement
   block               Block a ready or active requirement
   unblock             Restore a blocked requirement
-  abandon             Release an assignment while retaining its worktree
+  release             Release an assignment while retaining its worktree
+  discard             Remove a retained released assignment worktree
+  deprecate           Permanently deprecate a requirement
+  archive             Archive all terminal requirements into an immutable phase
+  phase               List or inspect immutable phase archives
   list                List requirements and scheduling facts
   show                Show one requirement and assignment history
   doctor              Diagnose state, branch, and worktree drift
-  log                 Read the append-only coordination event log
+  log                 Read the current phase's append-only coordination event log
   stamp               Append a timestamped requirement note
   agent-instructions  Print the Agent integration contract
 
@@ -1266,7 +1609,11 @@ function main(arguments_ = process.argv.slice(2)): number {
     done: withCommandLock(handleDone),
     block: handleBlock,
     unblock: handleUnblock,
-    abandon: handleAbandon,
+    release: handleRelease,
+    discard: handleDiscard,
+    deprecate: handleDeprecate,
+    archive: handleArchive,
+    phase: withCommandLock(handlePhase),
     show: handleShow,
     stamp: handleStamp,
     log: handleLog,

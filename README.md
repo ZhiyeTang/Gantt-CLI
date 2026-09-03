@@ -66,10 +66,11 @@ A requirement cannot become `done` until its commit is merged, its worktree is c
 
 ## How it works
 
-Gantt-CLI manages two core objects:
+Gantt-CLI manages three core objects:
 
 - **Requirement:** the outcome to deliver, including its scope, dependencies, verification command, and status.
 - **Assignment:** one execution attempt, including its branch, worktree, base commit, source commit, and merge commit.
+- **Phase:** an immutable archive of every requirement in a completed planning horizon, plus an Agent-written summary grounded in Git history.
 
 A requirement normally moves through this lifecycle:
 
@@ -78,6 +79,9 @@ ready -> active -> done
   |        |
   v        v
 blocked  blocked
+  |
+  v
+deprecated
 ```
 
 Unblocking returns the requirement to `ready` or `active`. A failed verification leaves it `active` with a cleaned assignment, so `done` can be retried after the failure is fixed.
@@ -136,6 +140,24 @@ npx gantt-cli@latest repair ASN-0001
 
 `repair` validates the retained branch and worktree binding, then retries recursive submodule initialization.
 
+### 4. Archive a phase
+
+Archival is explicit and all-or-nothing. Every current requirement must be `done` or `deprecated`, and no assignment worktree may remain. First ask gantt-cli for the immutable commit manifest:
+
+```bash
+npx gantt-cli@latest archive --prepare --json
+```
+
+An Agent uses the returned Git evidence to write a Markdown summary, then finalizes the archive with the returned fingerprint:
+
+```bash
+npx gantt-cli@latest archive \
+  --fingerprint <sha256-from-prepare> \
+  --summary-file phase-summary.md
+```
+
+The result is an immutable `PHASE-001`. Current requirement, assignment, and event IDs restart from their initial ranges. Historical IDs remain unambiguous through qualified references such as `PHASE-001/REQ-0001`.
+
 ## Command reference
 
 | Command | Purpose |
@@ -149,7 +171,11 @@ npx gantt-cli@latest repair ASN-0001
 | `cleanup` | Remove a clean, merged assignment's worktree |
 | `done` | Verify delivery facts and complete a requirement |
 | `block` / `unblock` | Apply or remove a manual block |
-| `abandon` | Abandon an assignment while preserving its requirement |
+| `release` | Release an assignment while preserving its requirement and worktree |
+| `discard` | Remove a clean worktree retained by a released assignment |
+| `deprecate` | Permanently stop a requirement that will not be delivered |
+| `archive` | Archive all terminal requirements into an immutable Phase |
+| `phase` | List or inspect Phase archives |
 | `repair` | Retry submodule provisioning for a retained failed assignment |
 | `list` / `show` | Inspect requirements and assignments |
 | `doctor` | Check repository, state, and worktree consistency |
@@ -187,9 +213,12 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 - `merge` rejects out-of-scope paths before changing the primary worktree and records immutable source/merge commit evidence.
 - `update` records path-claim changes in the event log and rejects new active conflicts unless explicitly forced.
 - `cleanup` refuses uncommitted changes, including recursive submodule changes, and preserves nested repositories whose Git data exists only inside the worktree.
+- `release` keeps interrupted work available; `discard` applies the same clean-worktree and nested-repository protections before removing it.
 - `done` verifies recorded merge ancestry and worktree cleanup without requiring the assignment branch, then runs the optional verification command in the primary worktree.
 - Verification output and exit status are recorded on the assignment; a failure keeps completion retryable.
 - `repair` validates current Git facts before retrying a retained provisioning failure.
+- Phase data lives under `.git/gantt-cli/phases/PHASE-xxx/`; `doctor` verifies each archive and summary against the hashes recorded in active state.
+- Schema-v3 registries migrate automatically: cancelled requirements become deprecated and abandoned assignments become released.
 
 ## Requirements and limits
 

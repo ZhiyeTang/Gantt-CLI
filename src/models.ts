@@ -2,17 +2,21 @@ import { posix } from "node:path";
 
 import { RegistryError, ValidationError } from "./errors.js";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
+export const PHASE_ARCHIVE_SCHEMA_VERSION = 1;
 export const PRIORITIES = ["p0", "p1", "p2", "p3"] as const;
 export const PRIORITY_ORDER = new Map(PRIORITIES.map((priority, index) => [priority, index]));
 export const LIVE_ASSIGNMENT_STATUSES = new Set(["active", "blocked", "merged", "cleaned"]);
 
 const REQUIREMENT_ID = /^REQ-\d{4,}$/;
 const ASSIGNMENT_ID = /^ASN-\d{4,}$/;
+const EVENT_ID = /^EVT-\d{6,}$/;
+const PHASE_ID = /^PHASE-\d{3,}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const DOMAIN = /^[a-z0-9][a-z0-9._/-]*$/;
-const REQUIREMENT_STATUSES = new Set(["ready", "active", "blocked", "done", "cancelled"]);
+const REQUIREMENT_STATUSES = new Set(["ready", "active", "blocked", "done", "deprecated"]);
 const ASSIGNMENT_STATUSES = new Set([
-  "active", "blocked", "merged", "cleaned", "completed", "abandoned", "provisioning_failed", "legacy",
+  "active", "blocked", "merged", "cleaned", "completed", "released", "discarded", "provisioning_failed", "legacy",
 ]);
 
 export type JsonObject = { [key: string]: unknown };
@@ -36,6 +40,8 @@ export interface Requirement extends JsonObject {
   createdAt: string;
   updatedAt: string;
   stamps: Stamp[];
+  deprecatedAt?: string;
+  deprecationReason?: string;
 }
 
 export interface Assignment extends JsonObject {
@@ -52,6 +58,9 @@ export interface Assignment extends JsonObject {
   mergedAt?: string;
   cleanupPending?: boolean;
   cleanupAt?: string;
+  releasedAt?: string;
+  releaseReason?: string;
+  discardedAt?: string;
   status: string;
   createdAt: string;
   updatedAt: string;
@@ -67,17 +76,72 @@ export interface Event extends JsonObject {
   data?: JsonObject;
 }
 
+export interface Phase extends JsonObject {
+  id: string;
+  archivedAt: string;
+  requirementCount: number;
+  assignmentCount: number;
+  eventCount: number;
+  fingerprint: string;
+  archiveHash: string;
+  summaryHash: string;
+}
+
+export interface PhaseArchive extends JsonObject {
+  schemaVersion: number;
+  phaseId: string;
+  archivedAt: string;
+  fingerprint: string;
+  repository: { root: string; commonGitDir: string };
+  requirements: Requirement[];
+  assignments: Assignment[];
+  events: Event[];
+}
+
+export function parsePhaseArchive(raw: unknown): PhaseArchive {
+  if (!isObject(raw) || raw.schemaVersion !== PHASE_ARCHIVE_SCHEMA_VERSION
+    || typeof raw.phaseId !== "string" || !PHASE_ID.test(raw.phaseId)
+    || typeof raw.archivedAt !== "string" || typeof raw.fingerprint !== "string" || !SHA256.test(raw.fingerprint)
+    || !isObject(raw.repository) || typeof raw.repository.root !== "string" || typeof raw.repository.commonGitDir !== "string"
+    || !Array.isArray(raw.requirements) || !Array.isArray(raw.assignments) || !Array.isArray(raw.events)) {
+    throw new RegistryError("Phase archive is malformed.");
+  }
+  const archive = structuredClone(raw) as unknown as PhaseArchive;
+  const state: State = {
+    schemaVersion: SCHEMA_VERSION,
+    repository: archive.repository,
+    createdAt: archive.archivedAt,
+    updatedAt: archive.archivedAt,
+    nextPhaseNumber: 1,
+    nextRequirementNumber: 1,
+    nextAssignmentNumber: 1,
+    nextEventNumber: 1,
+    requirements: archive.requirements,
+    assignments: archive.assignments,
+    events: archive.events,
+    phases: [],
+  };
+  repairCounters(state);
+  validateCurrentState(state);
+  if (state.requirements.some((requirement) => !["done", "deprecated"].includes(requirement.status))) {
+    throw new RegistryError(`Phase ${archive.phaseId} contains a non-terminal requirement.`);
+  }
+  return archive;
+}
+
 export interface State extends JsonObject {
   schemaVersion: number;
   repository: { root: string; commonGitDir: string };
   createdAt: string;
   updatedAt: string;
+  nextPhaseNumber: number;
   nextRequirementNumber: number;
   nextAssignmentNumber: number;
   nextEventNumber: number;
   requirements: Requirement[];
   assignments: Assignment[];
   events: Event[];
+  phases: Phase[];
 }
 
 export function utcNow(): string {
@@ -116,12 +180,14 @@ export function initialState(repositoryRoot: string, commonGitDir: string): Stat
     repository: { root: repositoryRoot, commonGitDir },
     createdAt,
     updatedAt: createdAt,
+    nextPhaseNumber: 1,
     nextRequirementNumber: 1,
     nextAssignmentNumber: 1,
     nextEventNumber: 1,
     requirements: [],
     assignments: [],
     events: [],
+    phases: [],
   };
   appendEvent(state, "registry.initialized", { data: { schemaVersion: SCHEMA_VERSION } });
   return state;
@@ -204,6 +270,19 @@ export function nextAssignmentId(state: State): string {
   return nextId(state, "nextAssignmentNumber", "ASN");
 }
 
+export function nextPhaseId(state: State): string {
+  if (!Number.isInteger(state.nextPhaseNumber) || state.nextPhaseNumber < 1) {
+    throw new RegistryError("Registry nextPhaseNumber must be a positive integer.");
+  }
+  return `PHASE-${String(state.nextPhaseNumber).padStart(3, "0")}`;
+}
+
+export function normalizePhaseId(rawId: string): string {
+  const identifier = rawId.trim().toUpperCase();
+  if (!PHASE_ID.test(identifier)) throw new ValidationError(`Invalid phase ID: ${JSON.stringify(rawId)}`);
+  return identifier;
+}
+
 export function requirementById(state: State, rawId: string): Requirement {
   const identifier = rawId.trim().toUpperCase();
   const requirement = state.requirements.find((item) => item.id === identifier);
@@ -263,6 +342,7 @@ function maximumNumber(records: unknown, prefix: string): number {
 function repairCounters(state: JsonObject): boolean {
   let changed = false;
   const counters = [
+    ["nextPhaseNumber", maximumNumber(state.phases, "PHASE")],
     ["nextRequirementNumber", maximumNumber(state.requirements, "REQ")],
     ["nextAssignmentNumber", maximumNumber(state.assignments, "ASN")],
     ["nextEventNumber", maximumNumber(state.events, "EVT")],
@@ -288,12 +368,14 @@ function baseStateFromLegacy(rawState: JsonObject): State {
     },
     createdAt,
     updatedAt: utcNow(),
+    nextPhaseNumber: 1,
     nextRequirementNumber: 1,
     nextAssignmentNumber: 1,
     nextEventNumber: 1,
     requirements: [],
     assignments: [],
     events: [],
+    phases: [],
   };
 }
 
@@ -303,10 +385,10 @@ function migrateV1(rawState: JsonObject): State {
     throw new RegistryError("Legacy registry requirements must be a list.");
   }
   const requirementStatus: Record<string, string> = {
-    pending: "ready", in_progress: "active", blocked: "blocked", done: "done", cancelled: "cancelled",
+    pending: "ready", in_progress: "active", blocked: "blocked", done: "done", cancelled: "deprecated",
   };
   const assignmentStatus: Record<string, string> = {
-    pending: "legacy", in_progress: "active", blocked: "blocked", done: "completed", cancelled: "abandoned",
+    pending: "legacy", in_progress: "active", blocked: "blocked", done: "completed", cancelled: "released",
   };
   rawState.requirements.forEach((rawRequirement, index) => {
     if (!isObject(rawRequirement)) throw new RegistryError("Legacy registry contains a non-object requirement.");
@@ -318,6 +400,7 @@ function migrateV1(rawState: JsonObject): State {
     const legacyFiles = typeof rawRequirement.files === "string"
       ? [rawRequirement.files]
       : Array.isArray(rawRequirement.files) ? rawRequirement.files.filter((item): item is string => typeof item === "string") : [];
+    const status = requirementStatus[oldStatus] ?? "ready";
     state.requirements.push({
       id,
       request: String(rawRequirement.request ?? "Migrated legacy requirement"),
@@ -326,10 +409,14 @@ function migrateV1(rawState: JsonObject): State {
       dependsOn: [],
       domains: [],
       paths: normalizeProjectPaths(legacyFiles, false),
-      status: requirementStatus[oldStatus] ?? "ready",
+      status,
       createdAt,
       updatedAt,
       stamps: [],
+      ...(status === "deprecated" ? {
+        deprecatedAt: updatedAt,
+        deprecationReason: "Migrated from legacy cancelled status.",
+      } : {}),
     });
     if (["branch", "worktree", "session"].every((key) => typeof rawRequirement[key] === "string" && rawRequirement[key])) {
       state.assignments.push({
@@ -343,6 +430,7 @@ function migrateV1(rawState: JsonObject): State {
         status: assignmentStatus[oldStatus] ?? "legacy",
         createdAt,
         updatedAt,
+        ...(oldStatus === "cancelled" ? { releasedAt: updatedAt, releaseReason: "Migrated from legacy cancelled status." } : {}),
         migrationNote: "Migrated from schema v1; baseCommit is unavailable.",
       });
     }
@@ -351,19 +439,19 @@ function migrateV1(rawState: JsonObject): State {
   appendEvent(state, "registry.migrated", {
     data: { fromSchemaVersion: rawState.schemaVersion ?? 1, toSchemaVersion: SCHEMA_VERSION },
   });
-  validateV3(state);
+  validateCurrentState(state);
   return state;
 }
 
-function normalizeV3InPlace(state: JsonObject): boolean {
+function normalizeCurrentInPlace(state: JsonObject, migrateRenamedStatuses = false): boolean {
   let changed = false;
-  for (const [key, fallback] of [["assignments", []], ["events", []]] as const) {
+  for (const [key, fallback] of [["assignments", []], ["events", []], ["phases", []]] as const) {
     if (!(key in state)) {
       state[key] = fallback;
       changed = true;
     }
   }
-  for (const [key, fallback] of [["nextAssignmentNumber", 1], ["nextEventNumber", 1]] as const) {
+  for (const [key, fallback] of [["nextAssignmentNumber", 1], ["nextEventNumber", 1], ["nextPhaseNumber", 1]] as const) {
     if (!(key in state)) {
       state[key] = fallback;
       changed = true;
@@ -391,7 +479,26 @@ function normalizeV3InPlace(state: JsonObject): boolean {
       } else if (requirement.status === "in_progress") {
         requirement.status = "active";
         changed = true;
+      } else if (migrateRenamedStatuses && requirement.status === "cancelled") {
+        requirement.status = "deprecated";
+        requirement.deprecatedAt = typeof requirement.updatedAt === "string" ? requirement.updatedAt : utcNow();
+        requirement.deprecationReason = "Migrated from cancelled status.";
+        changed = true;
       }
+    }
+  }
+  if (migrateRenamedStatuses && Array.isArray(state.assignments)) {
+    for (const assignment of state.assignments) {
+      if (!isObject(assignment) || assignment.status !== "abandoned") continue;
+      assignment.status = "released";
+      assignment.releasedAt = typeof assignment.abandonedAt === "string"
+        ? assignment.abandonedAt : typeof assignment.updatedAt === "string" ? assignment.updatedAt : utcNow();
+      if (typeof assignment.abandonReason === "string" && assignment.abandonReason) {
+        assignment.releaseReason = assignment.abandonReason;
+      }
+      delete assignment.abandonedAt;
+      delete assignment.abandonReason;
+      changed = true;
     }
   }
   if (repairCounters(state)) changed = true;
@@ -405,16 +512,28 @@ function normalizeV3InPlace(state: JsonObject): boolean {
 function migrateV2(rawState: JsonObject): State {
   const state = structuredClone(rawState);
   state.schemaVersion = SCHEMA_VERSION;
-  normalizeV3InPlace(state);
+  normalizeCurrentInPlace(state, true);
   const typed = state as unknown as State;
   appendEvent(typed, "registry.migrated", {
     data: { fromSchemaVersion: 2, toSchemaVersion: SCHEMA_VERSION },
   });
-  validateV3(typed);
+  validateCurrentState(typed);
   return typed;
 }
 
-function validateV3(state: State): void {
+function migrateV3(rawState: JsonObject): State {
+  const state = structuredClone(rawState);
+  state.schemaVersion = SCHEMA_VERSION;
+  normalizeCurrentInPlace(state, true);
+  const typed = state as unknown as State;
+  appendEvent(typed, "registry.migrated", {
+    data: { fromSchemaVersion: 3, toSchemaVersion: SCHEMA_VERSION },
+  });
+  validateCurrentState(typed);
+  return typed;
+}
+
+function validateCurrentState(state: State): void {
   if (state.schemaVersion !== SCHEMA_VERSION) {
     throw new RegistryError(`Unsupported gantt-cli registry schema: ${JSON.stringify(state.schemaVersion)}.`);
   }
@@ -423,10 +542,10 @@ function validateV3(state: State): void {
     || typeof state.repository.commonGitDir !== "string") {
     throw new RegistryError("Registry repository metadata is malformed.");
   }
-  for (const key of ["requirements", "assignments", "events"] as const) {
+  for (const key of ["requirements", "assignments", "events", "phases"] as const) {
     if (!Array.isArray(state[key])) throw new RegistryError(`Registry ${key} must be a list.`);
   }
-  for (const key of ["nextRequirementNumber", "nextAssignmentNumber", "nextEventNumber"] as const) {
+  for (const key of ["nextPhaseNumber", "nextRequirementNumber", "nextAssignmentNumber", "nextEventNumber"] as const) {
     if (!Number.isInteger(state[key]) || state[key] < 1) {
       throw new RegistryError(`Registry ${key} must be a positive integer.`);
     }
@@ -462,6 +581,11 @@ function validateV3(state: State): void {
     if (!Array.isArray(requirement.stamps)) {
       throw new RegistryError(`Requirement ${requirement.id} has invalid stamps.`);
     }
+    if (requirement.status === "deprecated"
+      && (typeof requirement.deprecatedAt !== "string"
+        || typeof requirement.deprecationReason !== "string" || !requirement.deprecationReason.trim())) {
+      throw new RegistryError(`Deprecated requirement ${requirement.id} is missing deprecation evidence.`);
+    }
   }
   for (const requirement of state.requirements) {
     if (requirement.dependsOn.includes(requirement.id)
@@ -490,6 +614,43 @@ function validateV3(state: State): void {
     if (assignment.status !== "legacy" && typeof assignment.baseCommit !== "string") {
       throw new RegistryError(`Assignment ${assignment.id} is missing baseCommit.`);
     }
+    if (["released", "discarded"].includes(assignment.status) && typeof assignment.releasedAt !== "string") {
+      throw new RegistryError(`Assignment ${assignment.id} is missing release evidence.`);
+    }
+    if (assignment.status === "discarded" && typeof assignment.discardedAt !== "string") {
+      throw new RegistryError(`Assignment ${assignment.id} is missing discard evidence.`);
+    }
+  }
+  const eventIds = new Set<string>();
+  for (const event of state.events) {
+    if (!isObject(event) || typeof event.id !== "string" || !EVENT_ID.test(event.id)
+      || typeof event.at !== "string" || typeof event.type !== "string" || !event.type) {
+      throw new RegistryError("Registry has a malformed event.");
+    }
+    if (eventIds.has(event.id)) throw new RegistryError(`Registry duplicates event ID ${event.id}.`);
+    eventIds.add(event.id);
+    if (event.requirementId !== undefined && (typeof event.requirementId !== "string" || !requirementIds.has(event.requirementId))) {
+      throw new RegistryError(`Event ${event.id} references an unknown requirement.`);
+    }
+    if (event.assignmentId !== undefined && (typeof event.assignmentId !== "string" || !assignmentIds.has(event.assignmentId))) {
+      throw new RegistryError(`Event ${event.id} references an unknown assignment.`);
+    }
+  }
+  const phaseIds = new Set<string>();
+  for (const phase of state.phases) {
+    if (!isObject(phase) || typeof phase.id !== "string" || !PHASE_ID.test(phase.id)
+      || typeof phase.archivedAt !== "string" || typeof phase.fingerprint !== "string" || !SHA256.test(phase.fingerprint)
+      || typeof phase.archiveHash !== "string" || !SHA256.test(phase.archiveHash)
+      || typeof phase.summaryHash !== "string" || !SHA256.test(phase.summaryHash)) {
+      throw new RegistryError("Registry has malformed phase metadata.");
+    }
+    if (phaseIds.has(phase.id)) throw new RegistryError(`Registry duplicates phase ID ${phase.id}.`);
+    phaseIds.add(phase.id);
+    for (const key of ["requirementCount", "assignmentCount", "eventCount"] as const) {
+      if (!Number.isInteger(phase[key]) || phase[key] < 0) {
+        throw new RegistryError(`Phase ${phase.id} has an invalid ${key}.`);
+      }
+    }
   }
 }
 
@@ -502,9 +663,10 @@ export function normalizeState(rawState: unknown): { state: State; migrated: boo
   }
   if ((version as number) <= 1) return { state: migrateV1(rawState), migrated: true };
   if (version === 2) return { state: migrateV2(rawState), migrated: true };
+  if (version === 3) return { state: migrateV3(rawState), migrated: true };
   const state = structuredClone(rawState);
-  const migrated = normalizeV3InPlace(state);
+  const migrated = normalizeCurrentInPlace(state);
   const typed = state as unknown as State;
-  validateV3(typed);
+  validateCurrentState(typed);
   return { state: typed, migrated };
 }

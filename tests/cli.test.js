@@ -81,7 +81,7 @@ function writeState(project, state) {
   writeFileSync(statePath(project), `${JSON.stringify(state, null, 2)}\n`);
 }
 
-test("init creates a schema-v3 state file through the CLI", () => {
+test("init creates a schema-v4 state file through the CLI", () => {
   const project = fixture();
   try {
     const result = invoke("init", "--repo", project.repository);
@@ -91,7 +91,9 @@ test("init creates a schema-v3 state file through the CLI", () => {
     const state = JSON.parse(
       readFileSync(join(project.repository, ".git", "gantt-cli", "state.json"), "utf8"),
     );
-    assert.equal(state.schemaVersion, 3);
+    assert.equal(state.schemaVersion, 4);
+    assert.equal(state.nextPhaseNumber, 1);
+    assert.deepEqual(state.phases, []);
     assert.equal(state.repository.root, realpathSync(project.repository));
     assert.equal(state.events[0].type, "registry.initialized");
   } finally {
@@ -360,7 +362,7 @@ test("start binds an assignment to an isolated linked worktree", () => {
     assert.equal(result.assignment.requirementId, "REQ-0001");
     assert.equal(result.assignment.session, "session-test-01");
     assert.equal(result.assignment.status, "active");
-    assert.match(result.assignment.branch, /^codex\/req-0001-login-interface-asn-0001$/);
+    assert.match(result.assignment.branch, /^codex\/phase-001-req-0001-login-interface-asn-0001$/);
     assert.equal(git(result.assignment.worktree, "branch", "--show-current").trim(), result.assignment.branch);
 
     const linkedAdd = invoke(
@@ -775,9 +777,43 @@ test("list migrates a legacy schema-v1 registry without losing evidence", () => 
     assert.equal(listed.status, 0, listed.stderr);
     assert.equal(JSON.parse(listed.stdout).requirements[0].status, "ready");
     const migrated = JSON.parse(readFileSync(join(registryDirectory, "state.json"), "utf8"));
-    assert.equal(migrated.schemaVersion, 3);
+    assert.equal(migrated.schemaVersion, 4);
     assert.equal(migrated.assignments[0].status, "legacy");
     assert.equal(migrated.events.at(-1).type, "registry.migrated");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("schema-v3 migration renames cancelled requirements and abandoned assignments", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    assert.equal(invoke("release", "--repo", project.repository, "REQ-0001", "--reason", "stopped").status, 0);
+    const legacy = readState(project);
+    legacy.schemaVersion = 3;
+    delete legacy.nextPhaseNumber;
+    delete legacy.phases;
+    legacy.requirements[0].status = "cancelled";
+    legacy.assignments[0].status = "abandoned";
+    legacy.assignments[0].abandonedAt = legacy.assignments[0].releasedAt;
+    legacy.assignments[0].abandonReason = legacy.assignments[0].releaseReason;
+    delete legacy.assignments[0].releasedAt;
+    delete legacy.assignments[0].releaseReason;
+    writeState(project, legacy);
+
+    const listed = invoke("list", "--repo", project.repository, "--json");
+
+    assert.equal(listed.status, 0, listed.stderr);
+    const migrated = readState(project);
+    assert.equal(migrated.schemaVersion, 4);
+    assert.equal(migrated.requirements[0].status, "deprecated");
+    assert.match(migrated.requirements[0].deprecationReason, /Migrated from cancelled/);
+    assert.equal(migrated.assignments[0].status, "released");
+    assert.equal(migrated.assignments[0].releaseReason, "stopped");
+    assert.equal(migrated.nextPhaseNumber, 1);
+    assert.deepEqual(migrated.phases, []);
+    assert.equal(exists(assignment.worktree), true);
   } finally {
     project.cleanup();
   }
@@ -806,7 +842,7 @@ test("parallel add commands receive distinct IDs through the process lock", asyn
   }
 });
 
-test("block unblock abandon and reassign preserve assignment history", () => {
+test("block unblock release and reassign preserve assignment history", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -826,7 +862,7 @@ test("block unblock abandon and reassign preserve assignment history", () => {
     assert.equal(blocked.status, 0, blocked.stderr);
     assert.equal(invoke("unblock", "--repo", project.repository, "REQ-0001").status, 0);
     assert.equal(invoke(
-      "abandon", "--repo", project.repository, "REQ-0001", "--reason", "session stopped",
+      "release", "--repo", project.repository, "REQ-0001", "--reason", "session stopped",
     ).status, 0);
 
     const second = invoke(
@@ -840,8 +876,229 @@ test("block unblock abandon and reassign preserve assignment history", () => {
     assert.equal(shown.status, 0, shown.stderr);
     assert.deepEqual(
       JSON.parse(shown.stdout).assignments.map((item) => [item.id, item.status]),
-      [["ASN-0001", "abandoned"], ["ASN-0002", "active"]],
+      [["ASN-0001", "released"], ["ASN-0002", "active"]],
     );
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("release preserves interrupted work while discard and deprecate enforce terminal cleanup", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    mkdirSync(join(assignment.worktree, "src"), { recursive: true });
+    writeFileSync(join(assignment.worktree, "src", "draft.ts"), "export const draft = true;\n");
+
+    const released = invoke(
+      "release", "--repo", project.repository, "REQ-0001", "--reason", "session ended", "--json",
+    );
+    assert.equal(released.status, 0, released.stderr);
+    assert.equal(JSON.parse(released.stdout).assignment.status, "released");
+    assert.equal(readState(project).requirements[0].status, "ready");
+
+    const dirtyDiscard = invoke("discard", "--repo", project.repository, assignment.id);
+    assert.equal(dirtyDiscard.status, 2);
+    assert.match(dirtyDiscard.stderr, /uncommitted changes/);
+
+    git(assignment.worktree, "add", "src/draft.ts");
+    git(assignment.worktree, "commit", "-m", "preserve draft");
+    const discarded = invoke("discard", "--repo", project.repository, assignment.id, "--json");
+    assert.equal(discarded.status, 0, discarded.stderr);
+    assert.equal(JSON.parse(discarded.stdout).assignment.status, "discarded");
+    assert.equal(exists(assignment.worktree), false);
+    assert.notEqual(git(project.repository, "branch", "--list", assignment.branch).trim(), "");
+
+    const missingReason = invoke("deprecate", "--repo", project.repository, "REQ-0001");
+    assert.equal(missingReason.status, 2);
+    assert.match(missingReason.stderr, /--reason is required/);
+    const deprecated = invoke(
+      "deprecate", "--repo", project.repository, "REQ-0001", "--reason", "superseded", "--json",
+    );
+    assert.equal(deprecated.status, 0, deprecated.stderr);
+    assert.equal(JSON.parse(deprecated.stdout).requirement.status, "deprecated");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("deprecate rejects requirements that still have non-terminal dependents", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository, "--request", "Foundation", "--path", "src/core.ts",
+    ).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository, "--request", "Dependent", "--path", "src/use.ts",
+      "--depends-on", "REQ-0001",
+    ).status, 0);
+
+    const blocked = invoke(
+      "deprecate", "--repo", project.repository, "REQ-0001", "--reason", "no longer needed",
+    );
+    assert.equal(blocked.status, 2);
+    assert.match(blocked.stderr, /still required.*REQ-0002/);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0002", "--reason", "dependent removed",
+    ).status, 0);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0001", "--reason", "no longer needed",
+    ).status, 0);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("archive creates an immutable phase and restarts all active IDs", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/delivered.ts", "export const delivered = true;\n");
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+    assert.equal(invoke("cleanup", "--repo", project.repository, "REQ-0001").status, 0);
+    assert.equal(invoke("done", "--repo", project.repository, "REQ-0001").status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository, "--request", "Obsolete", "--path", "src/obsolete.ts",
+    ).status, 0);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0002", "--reason", "superseded",
+    ).status, 0);
+
+    const prepared = invoke("archive", "--repo", project.repository, "--prepare", "--json");
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const manifest = JSON.parse(prepared.stdout);
+    assert.equal(manifest.phaseId, "PHASE-001");
+    assert.match(manifest.fingerprint, /^[a-f0-9]{64}$/);
+    assert.deepEqual(manifest.requirements.map((item) => item.status), ["done", "deprecated"]);
+    assert.match(manifest.guidance, /merged commits as delivered work/);
+
+    const summaryPath = join(dirname(project.repository), "phase-summary.md");
+    writeFileSync(summaryPath, "# Phase summary\n\n## Delivered\n\n- Delivered feature.\n");
+    const archived = invoke(
+      "archive", "--repo", project.repository,
+      "--fingerprint", manifest.fingerprint, "--summary-file", summaryPath, "--json",
+    );
+    assert.equal(archived.status, 0, archived.stderr);
+    assert.equal(JSON.parse(archived.stdout).phase.id, "PHASE-001");
+
+    const state = readState(project);
+    assert.deepEqual(state.requirements, []);
+    assert.deepEqual(state.assignments, []);
+    assert.equal(state.nextRequirementNumber, 1);
+    assert.equal(state.nextAssignmentNumber, 1);
+    assert.equal(state.events[0].id, "EVT-000001");
+    assert.equal(state.events[0].type, "phase.archived");
+    assert.equal(state.nextEventNumber, 2);
+    assert.equal(state.nextPhaseNumber, 2);
+    assert.equal(state.phases[0].id, "PHASE-001");
+
+    const phaseDirectory = join(project.repository, ".git", "gantt-cli", "phases", "PHASE-001");
+    assert.equal(exists(join(phaseDirectory, "archive.json")), true);
+    assert.equal(exists(join(phaseDirectory, "summary.md")), true);
+    const listedPhases = invoke("phase", "--repo", project.repository, "list", "--json");
+    assert.equal(JSON.parse(listedPhases.stdout).phases[0].id, "PHASE-001");
+    const shownPhase = invoke("phase", "--repo", project.repository, "show", "PHASE-001");
+    assert.match(shownPhase.stdout, /Delivered feature/);
+    const shownRequirement = invoke(
+      "show", "--repo", project.repository, "PHASE-001/REQ-0001", "--json",
+    );
+    assert.equal(JSON.parse(shownRequirement.stdout).phaseId, "PHASE-001");
+    assert.equal(invoke("doctor", "--repo", project.repository).status, 0);
+
+    const restarted = invoke(
+      "add", "--repo", project.repository, "--request", "Next phase", "--path", "src/next.ts", "--json",
+    );
+    assert.equal(JSON.parse(restarted.stdout).requirement.id, "REQ-0001");
+    const restartedAssignment = invoke(
+      "start", "--repo", project.repository, "REQ-0001",
+      "--session", "session-next", "--alias", "change", "--json",
+    );
+    assert.equal(restartedAssignment.status, 0, restartedAssignment.stderr);
+    assert.equal(JSON.parse(restartedAssignment.stdout).assignment.id, "ASN-0001");
+    assert.match(JSON.parse(restartedAssignment.stdout).assignment.branch, /^codex\/phase-002-/);
+    const blockedArchive = invoke("archive", "--repo", project.repository, "--prepare");
+    assert.equal(blockedArchive.status, 2);
+    assert.match(blockedArchive.stderr, /REQ-0001 is active/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("archive rejects stale fingerprints and doctor detects modified phase contents", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository, "--request", "Obsolete", "--path", "src/old.ts",
+    ).status, 0);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0001", "--reason", "superseded",
+    ).status, 0);
+    const prepared = JSON.parse(invoke(
+      "archive", "--repo", project.repository, "--prepare", "--json",
+    ).stdout);
+    assert.equal(invoke(
+      "stamp", "--repo", project.repository, "REQ-0001", "--note", "late context",
+    ).status, 0);
+    const summaryPath = join(dirname(project.repository), "summary.md");
+    writeFileSync(summaryPath, "# Summary\n");
+    const stale = invoke(
+      "archive", "--repo", project.repository,
+      "--fingerprint", prepared.fingerprint, "--summary-file", summaryPath,
+    );
+    assert.equal(stale.status, 2);
+    assert.match(stale.stderr, /fingerprint changed/);
+
+    const fresh = JSON.parse(invoke(
+      "archive", "--repo", project.repository, "--prepare", "--json",
+    ).stdout);
+    assert.equal(invoke(
+      "archive", "--repo", project.repository,
+      "--fingerprint", fresh.fingerprint, "--summary-file", summaryPath,
+    ).status, 0);
+    const archivedSummary = join(
+      project.repository, ".git", "gantt-cli", "phases", "PHASE-001", "summary.md",
+    );
+    writeFileSync(archivedSummary, "# Modified\n");
+    const diagnosed = invoke("doctor", "--repo", project.repository, "--json");
+    assert.equal(diagnosed.status, 1);
+    assert.equal(JSON.parse(diagnosed.stdout).issues.some((issue) => issue.code === "phase_integrity"), true);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("archive retry recovers a phase directory written before state finalization", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository, "--request", "Obsolete", "--path", "src/old.ts",
+    ).status, 0);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0001", "--reason", "superseded",
+    ).status, 0);
+    const prepared = JSON.parse(invoke(
+      "archive", "--repo", project.repository, "--prepare", "--json",
+    ).stdout);
+    const preArchiveState = readState(project);
+    const summaryPath = join(dirname(project.repository), "summary.md");
+    writeFileSync(summaryPath, "# Summary\n");
+    assert.equal(invoke(
+      "archive", "--repo", project.repository,
+      "--fingerprint", prepared.fingerprint, "--summary-file", summaryPath,
+    ).status, 0);
+
+    writeState(project, preArchiveState);
+    const recovered = invoke(
+      "archive", "--repo", project.repository,
+      "--fingerprint", prepared.fingerprint, "--summary-file", summaryPath, "--json",
+    );
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(JSON.parse(recovered.stdout).recoveredArtifacts, true);
+    assert.equal(readState(project).phases.length, 1);
+    assert.equal(invoke("doctor", "--repo", project.repository).status, 0);
   } finally {
     project.cleanup();
   }
@@ -917,7 +1174,7 @@ test("repair reuses a worktree retained after submodule provisioning fails", () 
   }
 });
 
-test("doctor reports retained abandoned worktrees as recoverable warnings", () => {
+test("doctor reports retained released worktrees as recoverable warnings", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -930,7 +1187,7 @@ test("doctor reports retained abandoned worktrees as recoverable warnings", () =
       "--session", "session-test", "--alias", "auth",
     ).status, 0);
     assert.equal(invoke(
-      "abandon", "--repo", project.repository, "REQ-0001", "--reason", "stopped",
+      "release", "--repo", project.repository, "REQ-0001", "--reason", "stopped",
     ).status, 0);
 
     const diagnosed = invoke("doctor", "--repo", project.repository, "--json");
@@ -939,7 +1196,7 @@ test("doctor reports retained abandoned worktrees as recoverable warnings", () =
     const result = JSON.parse(diagnosed.stdout);
     assert.equal(result.ok, true);
     assert.equal(result.issues[0].severity, "warning");
-    assert.equal(result.issues[0].code, "abandoned_worktree");
+    assert.equal(result.issues[0].code, "released_worktree");
   } finally {
     project.cleanup();
   }
@@ -968,7 +1225,11 @@ test("help and agent-instructions expose the complete CLI contract", () => {
     done: "<requirement-id>",
     block: "--reason <text>",
     unblock: "<requirement-id>",
-    abandon: "--reason <text>",
+    release: "--reason <text>",
+    discard: "<assignment-id>",
+    deprecate: "--reason <text>",
+    archive: "--prepare",
+    phase: "<list|show> [phase-id]",
     list: "--json",
     show: "<requirement-id>",
     doctor: "--json",
@@ -988,6 +1249,9 @@ test("help and agent-instructions expose the complete CLI contract", () => {
   assert.match(instructions.stdout, /Agent integration contract/);
   assert.match(instructions.stdout, /npx gantt-cli@next merge.*npx gantt-cli@next cleanup.*npx gantt-cli@next done/);
   assert.match(instructions.stdout, /branch may be retained or deleted/);
+  assert.match(instructions.stdout, /release.*discard/);
+  assert.match(instructions.stdout, /archive --prepare --json/);
+  assert.doesNotMatch(instructions.stdout, /\babandon\b/);
 });
 
 test("start rechecks unfinished dependencies and active claim conflicts", () => {
