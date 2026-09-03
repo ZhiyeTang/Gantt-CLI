@@ -24,20 +24,12 @@ export interface Schedule {
   decisions: Record<string, Record<string, unknown>>;
 }
 
-type ListLane = "ACTIVE" | "NEXT" | "QUEUED" | "WAITING" | "BLOCKED" | "CLOSED";
+type ListGroup = "ACTIVE" | "READY" | "BLOCKED" | "CLOSED";
 
-interface ListItem {
-  requirement: Requirement;
-  marker: string;
-  detail: string;
-}
-
-const LIST_LANES: ListLane[] = ["ACTIVE", "NEXT", "QUEUED", "WAITING", "BLOCKED", "CLOSED"];
-const LANE_STYLES: Record<ListLane, (value: string) => string> = {
+const LIST_GROUPS: ListGroup[] = ["ACTIVE", "READY", "BLOCKED", "CLOSED"];
+const GROUP_STYLES: Record<ListGroup, (value: string) => string> = {
   ACTIVE: pc.green,
-  NEXT: pc.cyan,
-  QUEUED: pc.blue,
-  WAITING: pc.yellow,
+  READY: pc.cyan,
   BLOCKED: pc.red,
   CLOSED: pc.gray,
 };
@@ -256,62 +248,42 @@ function styledPriority(priority: string): string {
   return pc.gray(priority);
 }
 
-function waitingDetail(decision: Record<string, unknown>): string {
-  if (decision.reason === "dependencies" && Array.isArray(decision.dependencies)) {
-    return `waits for ${decision.dependencies.join(", ")}`;
-  }
-  if (decision.reason === "active_claims" && Array.isArray(decision.conflicts)) {
-    const blockers = (decision.conflicts as Conflict[])
-      .map((conflict) => `${conflict.requirementId}/${conflict.assignmentId}`).join(", ");
-    return `conflicts with active ${blockers}`;
-  }
-  return "waiting";
+function compactRequest(request: string): string {
+  const characters = [...request];
+  return characters.length > 40 ? `${characters.slice(0, 39).join("")}…` : request;
 }
 
-export function renderList(state: State): string {
+export function renderList(state: State, includeClosed = false): string {
   if (state.requirements.length === 0) return "No requirements registered.";
-  const schedule = buildSchedule(state);
-  const lanes: Record<ListLane, ListItem[]> = {
-    ACTIVE: [], NEXT: [], QUEUED: [], WAITING: [], BLOCKED: [], CLOSED: [],
+  const groups: Record<ListGroup, Requirement[]> = {
+    ACTIVE: [], READY: [], BLOCKED: [], CLOSED: [],
   };
 
   for (const requirement of state.requirements) {
-    const assignment = liveAssignmentForRequirement(state, requirement.id);
-    const decision = schedule.decisions[requirement.id];
     if (requirement.status === "active") {
-      lanes.ACTIVE.push({
-        requirement,
-        marker: "▶",
-        detail: assignment ? `${assignment.alias} · ${assignment.status}` : "active",
-      });
+      groups.ACTIVE.push(requirement);
     } else if (requirement.status === "blocked") {
-      const reason = typeof requirement.blockedReason === "string" ? requirement.blockedReason : "blocked";
-      lanes.BLOCKED.push({ requirement, marker: "!", detail: reason });
-    } else if (requirement.status === "ready" && decision?.kind === "batch") {
-      const batch = Number(decision.batch);
-      const lane = batch === 0 ? "NEXT" : "QUEUED";
-      lanes[lane].push({ requirement, marker: batch === 0 ? "●" : "○", detail: `batch ${batch}` });
-    } else if (requirement.status === "ready" && decision?.kind === "deferred") {
-      lanes.WAITING.push({ requirement, marker: "◌", detail: waitingDetail(decision) });
+      groups.BLOCKED.push(requirement);
+    } else if (requirement.status === "ready") {
+      groups.READY.push(requirement);
     } else {
-      const reason = typeof requirement.deprecationReason === "string" ? ` · ${requirement.deprecationReason}` : "";
-      lanes.CLOSED.push({
-        requirement,
-        marker: requirement.status === "done" ? "✓" : "×",
-        detail: `${requirement.status}${reason}`,
-      });
+      groups.CLOSED.push(requirement);
     }
   }
 
-  const lines = [`Gantt · ${state.requirements.length} requirements`];
-  for (const lane of LIST_LANES) {
-    const items = lanes[lane];
+  const lines = [`${"ID".padEnd(12)}${"PRI".padEnd(5)}TASK`, pc.dim("─".repeat(57))];
+  for (const group of LIST_GROUPS) {
+    const items = groups[group];
     if (items.length === 0) continue;
-    const style = LANE_STYLES[lane];
-    lines.push("", pc.bold(style(`${lane.padEnd(8)} ${items.length}`)));
-    for (const item of items) {
-      lines.push(`  ${style(item.marker)} ${pc.bold(item.requirement.id)}  ${item.requirement.request}`);
-      lines.push(`    ${styledPriority(item.requirement.priority)} · ${item.requirement.points}pt · ${pc.dim(item.detail)}`);
+    const style = GROUP_STYLES[group];
+    if (group === "CLOSED" && !includeClosed) {
+      lines.push("", style(`CLOSED ${items.length} · use gantt-cli list --all`));
+      continue;
+    }
+    lines.push("", pc.bold(style(`${group} ${items.length}`)));
+    for (const requirement of items) {
+      const priority = `${styledPriority(requirement.priority)}${" ".repeat(5 - requirement.priority.length)}`;
+      lines.push(`${requirement.id.padEnd(12)}${priority}${compactRequest(requirement.request)}`);
     }
   }
   return lines.join("\n");

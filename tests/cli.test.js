@@ -172,7 +172,7 @@ test("add and schedule preserve stable requirement planning behavior", () => {
   }
 });
 
-test("list groups requirements into operational swimlanes", () => {
+test("list renders a compact table grouped by requirement status", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -195,26 +195,48 @@ test("list groups requirements into operational swimlanes", () => {
     assert.equal(invoke(
       "block", "--repo", project.repository, "REQ-0005", "--reason", "release window closed",
     ).status, 0);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0004", "--reason", "docs no longer needed",
+    ).status, 0);
 
     const listed = invoke("list", "--repo", project.repository);
 
     assert.equal(listed.status, 0, listed.stderr);
-    assert.match(listed.stdout, /^Gantt · 5 requirements/m);
+    assert.match(listed.stdout, /^ID\s+PRI\s+TASK\n/);
     assert.match(listed.stdout, /^ACTIVE\s+1$/m);
-    assert.match(listed.stdout, /REQ-0001\s+Implement authentication/);
-    assert.match(listed.stdout, /auth-api · active/);
-    assert.match(listed.stdout, /^NEXT\s+1$/m);
-    assert.match(listed.stdout, /REQ-0002\s+Build account UI/);
-    assert.match(listed.stdout, /^QUEUED\s+1$/m);
-    assert.match(listed.stdout, /REQ-0003\s+Polish account UI/);
-    assert.match(listed.stdout, /batch 1/);
-    assert.match(listed.stdout, /^WAITING\s+1$/m);
-    assert.match(listed.stdout, /REQ-0004\s+Document account UI/);
-    assert.match(listed.stdout, /waits for REQ-0002/);
+    assert.match(listed.stdout, /^REQ-0001\s+p2\s+Implement authentication$/m);
+    assert.match(listed.stdout, /^READY\s+2$/m);
+    assert.match(listed.stdout, /^REQ-0002\s+p2\s+Build account UI$/m);
+    assert.match(listed.stdout, /^REQ-0003\s+p2\s+Polish account UI$/m);
     assert.match(listed.stdout, /^BLOCKED\s+1$/m);
-    assert.match(listed.stdout, /REQ-0005\s+Prepare release/);
-    assert.match(listed.stdout, /release window closed/);
+    assert.match(listed.stdout, /^REQ-0005\s+p2\s+Prepare release$/m);
+    assert.match(listed.stdout, /^CLOSED 1 · use gantt-cli list --all$/m);
+    assert.doesNotMatch(listed.stdout, /REQ-0004/);
+    assert.doesNotMatch(listed.stdout, /auth-api|batch 1|release window closed|waits for/);
     assert.doesNotMatch(listed.stdout, /\u001b\[/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("list --all expands closed requirements", () => {
+  const project = fixture();
+  try {
+    assert.equal(invoke("init", "--repo", project.repository).status, 0);
+    assert.equal(invoke(
+      "add", "--repo", project.repository,
+      "--request", "Retire legacy path", "--path", "src/legacy/**", "--priority", "p3",
+    ).status, 0);
+    assert.equal(invoke(
+      "deprecate", "--repo", project.repository, "REQ-0001", "--reason", "obsolete",
+    ).status, 0);
+
+    const listed = invoke("list", "--repo", project.repository, "--all");
+
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.match(listed.stdout, /^CLOSED\s+1$/m);
+    assert.match(listed.stdout, /^REQ-0001\s+p3\s+Retire legacy path$/m);
+    assert.doesNotMatch(listed.stdout, /use gantt-cli list --all/);
   } finally {
     project.cleanup();
   }
@@ -1281,7 +1303,7 @@ test("doctor reports retained released worktrees as recoverable warnings", () =>
 test("help and agent-instructions expose the complete CLI contract", () => {
   const version = invoke("--version");
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(version.stdout.trim(), "0.1.0-alpha.3");
+  assert.equal(version.stdout.trim(), "0.1.0-alpha.4");
 
   const help = invoke("--help");
   assert.equal(help.status, 0, help.stderr);
