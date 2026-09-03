@@ -52,6 +52,7 @@ import {
   activeConflicts,
   buildSchedule,
   outOfScopePaths,
+  renderList,
   renderSchedule,
   requirementView,
 } from "./scheduler.js";
@@ -392,7 +393,7 @@ function handleList(args: ParsedArguments): number {
   if (args.flags.has("json")) {
     output({ requirements: state.requirements.map((requirement) => requirementView(state, requirement, schedule)) }, true);
   } else {
-    process.stdout.write(`${renderSchedule(state)}\n`);
+    process.stdout.write(`${renderList(state)}\n`);
   }
   return 0;
 }
