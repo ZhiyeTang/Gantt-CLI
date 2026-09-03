@@ -1,6 +1,6 @@
 {
   "name": "gantt-cli",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "A Git worktree scheduler for coding agents",
   "author": "ZhiyeTang <tangzhiye2022@foxmail.com>",
   "repository": {
