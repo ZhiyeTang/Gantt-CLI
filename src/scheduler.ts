@@ -59,7 +59,21 @@ export function claimConflictDetails(first: Requirement, second: Requirement): C
   return { domains, paths };
 }
 
-export function requirementsConflict(first: Requirement, second: Requirement): boolean {
+export function coordinationFor(state: State, requirement: Requirement) {
+  return state.coordinationPlans?.find((plan) => plan.members.some((member) => member.requirementId === requirement.id)
+    && plan.members.every((member) => {
+      const current = member.requirementId === requirement.id ? requirement : state.requirements.find((item) => item.id === member.requirementId);
+      return current && current.status !== "deprecated" && JSON.stringify(current.paths) === JSON.stringify(member.paths) && JSON.stringify(current.domains) === JSON.stringify(member.domains);
+    }));
+}
+
+function coordinated(state: State, first: Requirement, second: Requirement): boolean {
+  return Boolean(coordinationFor(state, first)?.members.some((member) => member.requirementId === second.id)
+    && coordinationFor(state, second));
+}
+
+export function requirementsConflict(first: Requirement, second: Requirement, state: State): boolean {
+  if (coordinated(state, first, second)) return false;
   const details = claimConflictDetails(first, second);
   return details.domains.length > 0 || details.paths.length > 0;
 }
@@ -69,6 +83,7 @@ export function activeConflicts(state: State, requirement: Requirement): Conflic
   for (const assignment of activeAssignments(state)) {
     if (assignment.requirementId === requirement.id) continue;
     const other = requirementById(state, assignment.requirementId);
+    if (coordinated(state, requirement, other)) continue;
     const details = claimConflictDetails(requirement, other);
     if (details.domains.length > 0 || details.paths.length > 0) {
       conflicts.push({
@@ -118,7 +133,7 @@ export function buildSchedule(state: State): Schedule {
 
   const batches: Requirement[][] = [];
   for (const requirement of candidates.sort(compareRequirements)) {
-    let index = batches.findIndex((batch) => !batch.some((existing) => requirementsConflict(requirement, existing)));
+    let index = batches.findIndex((batch) => !batch.some((existing) => requirementsConflict(requirement, existing, state)));
     if (index === -1) {
       index = batches.length;
       batches.push([]);

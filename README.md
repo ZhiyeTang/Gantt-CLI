@@ -2,9 +2,9 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-**A worktree-first scheduler for coding agents.**
+**A task-aware scheduler for coding agents.**
 
-> **Worktree-first development:** give every unit of work its own branch and worktree before an agent edits a file. Isolation is the default, coordination is explicit, and completion is verified against Git.
+> Complete lightweight work inline. Use isolated worktrees for collaboration or experimentation, record coordination, and finish managed work with one retryable command.
 
 <p align="center">
   <img src="./assets/gantt-cli-demo.gif" alt="Gantt-CLI schedules requirements into isolated Git worktrees and verifies delivery" width="900" />
@@ -84,11 +84,17 @@ blocked  blocked
 deprecated
 ```
 
-Unblocking returns the requirement to `ready` or `active`. A failed verification leaves it `active` with a cleaned assignment, so `done` can be retried after the failure is fixed.
+Unblocking returns the requirement to `ready` or `active`. A failed verification leaves it `active` with a `merged` assignment and retained worktree. Fix and commit there, then retry `finish`.
 
-The scheduler selects requirements whose dependencies are complete, whose scopes do not conflict, and which are otherwise ready to run. Add `--json` to consume its output from an agent or script.
+The scheduler selects requirements whose dependencies are complete, whose scopes do not conflict or have a valid coordination plan, and which are otherwise ready to run. Add `--json` to consume its output from an agent or script.
 
 ## Quick start
+
+### First decide whether to register
+
+The Agent briefly explains its classification: bounded, low-risk work with direct verification runs inline, without registration or a worktree. File count is not a threshold. If collaboration, dependency coordination, or isolation becomes necessary, upgrade automatically: record the original workspace state, transfer only task changes, verify them in the new worktree, then remove only those task changes from the original checkout. Keep unrelated edits. Preserve the original files and report ambiguity when ownership is unclear.
+
+The following steps apply to managed work.
 
 ### 1. Add requirements
 
@@ -125,12 +131,50 @@ npx gantt-cli@latest start REQ-0001 --session agent-1 --alias task-api
 ### 3. Merge and finish
 
 ```bash
-npx gantt-cli@latest merge REQ-0001
-npx gantt-cli@latest cleanup REQ-0001
-npx gantt-cli@latest done REQ-0001
+npx gantt-cli@latest finish REQ-0001 --json
 ```
 
-`merge` checks the assignment's declared path scope before changing the target branch and records the exact source and merge commits. Do not add commits to the assignment branch after merging unless you run `merge` again. Once no worktree checks out the branch, you may retain or delete it: `cleanup` and `done` use the recorded commits, and `cleanup` never deletes the branch automatically.
+`finish` checks, merges, verifies, preserves classified files, removes the worktree, and records `done`. On failure, follow the JSON `nextAction`, fix the problem, and retry the same command. Resolve Git conflicts in the primary worktree and run `git merge --continue`; fix failed verification in the retained task worktree and commit. Missing verification commands are reported explicitly. Task branches remain; nothing is pushed or archived automatically.
+
+The old `done` command has been removed. `finish` is the single completion entry point. `merge` and `cleanup` remain for diagnosis and repair; `cleanup` also verifies before deleting.
+
+#### Preserve local files
+
+Starting work records local file lists for the primary and task worktrees. Unrelated untracked primary files may remain; files that would be overwritten still block merging. Baselines describe provenance, not permission to delete. Names and ignored status do not determine ownership.
+
+Commit deliverable source files normally. Explicitly classify configuration, notes, build output, or dependency files that should be retained:
+
+```bash
+npx gantt-cli@latest classify REQ-0001 --path .env --path build --reason "Local settings and non-delivery build output"
+npx gantt-cli@latest finish REQ-0001 --json
+```
+
+`--path` names a concrete file or directory, not a glob. A directory classification covers only its current files; later files need classification separately. Before cleanup, classified files (including ignored files) are saved under `gantt-cli/preserved/<assignment-id>-<unique-key>/` in the Git common dir. The returned `assignment.preservationDirectory` identifies the saved location, which is not reused when phase IDs reset. Relative paths, contents, and file permissions are retained. Symlinks are preserved as links; their external targets are not read.
+
+Unclassified files, failed copies, or conflicting saved contents retain the worktree. Saved copies are never overwritten: retain the old copy elsewhere before retrying. Uncommitted tracked changes and nested repositories holding unique Git data still block removal. After `release`, use the assignment ID with `classify`, then `discard`; the same file protections apply.
+
+#### Work on the same file in parallel
+
+The Agent can record this `plan.json`; the member array is also the merge order:
+
+```json
+{
+  "members": [
+    { "requirementId": "REQ-0001", "work": "Update request parsing" },
+    { "requirementId": "REQ-0002", "work": "Update output in the same file" }
+  ],
+  "verify": "npm test"
+}
+```
+
+```bash
+npx gantt-cli@latest coordinate --plan-file plan.json
+npx gantt-cli@latest schedule --json
+```
+
+A valid plan permits same-module or same-file development in independent worktrees without repeated user approval. Merges are ordered; each completion runs the task's verification and the plan's integrated verification. Real `--depends-on` relationships still gate starting work. Use a plan for merge order alone. The UI task in Quick start has a real dependency; a plan does not waive it.
+
+Re-record the plan when scopes change. A member may include an optional `paths` array to update its claims atomically with the plan. Unlisted tasks receive no exemption. A new plan replaces all old plans that share any of its members; include remaining members if their coordination must continue. The old `--force` override has been removed.
 
 If submodule provisioning fails and the assignment worktree is retained:
 
@@ -169,7 +213,9 @@ The result is an immutable `PHASE-001`. Current requirement, assignment, and eve
 | `start` | Create a branch, worktree, and assignment |
 | `merge` | Merge an assignment into the target branch |
 | `cleanup` | Remove a clean, merged assignment's worktree |
-| `done` | Verify delivery facts and complete a requirement |
+| `finish` | Merge, verify, preserve files, clean up, and complete; retryable |
+| `classify` | Identify current local files to preserve |
+| `coordinate` | Record work division, merge order, and integrated verification |
 | `block` / `unblock` | Apply or remove a manual block |
 | `release` | Release an assignment while preserving its requirement and worktree |
 | `discard` | Remove a clean worktree retained by a released assignment |
@@ -209,12 +255,12 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 
 - State lives at `.git/gantt-cli/state.json` in the Git common dir and is not committed.
 - A lock file and atomic replacement protect concurrent writes.
-- Worktrees live in the adjacent `.gantt-worktrees/` directory by default.
+- Worktrees live in the adjacent `<repository-name>-worktrees/` directory by default.
 - `merge` rejects out-of-scope paths before changing the primary worktree and records immutable source/merge commit evidence.
-- `update` records path-claim changes in the event log and rejects new active conflicts unless explicitly forced.
-- `cleanup` refuses uncommitted changes, including recursive submodule changes, and preserves nested repositories whose Git data exists only inside the worktree.
+- `update` records scope changes; overlapping claims need a valid plan, which must be reconsidered when scopes change.
+- `cleanup` verifies before preserving classified files; tracked edits, unclassified files, and nested repositories with unique Git data block deletion.
 - `release` keeps interrupted work available; `discard` applies the same clean-worktree and nested-repository protections before removing it.
-- `done` verifies recorded merge ancestry and worktree cleanup without requiring the assignment branch, then runs the optional verification command in the primary worktree.
+- `finish` records merge intent before Git changes and recovers using exact commit relationships. Verification is bound to the target commit and runs before cleanup; a changed target requires verification again.
 - Verification output and exit status are recorded on the assignment; a failure keeps completion retryable.
 - `repair` validates current Git facts before retrying a retained provisioning failure.
 - Phase data lives under `.git/gantt-cli/phases/PHASE-xxx/`; `doctor` verifies each archive and summary against the hashes recorded in active state.
@@ -227,7 +273,7 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 - Scope conflicts come from explicit `--path` and `--domain` claims; semantic or runtime conflicts are not predicted
 - State-format compatibility is not guaranteed during the `0.1.0-alpha.0` release
 
-There are no third-party runtime dependencies.
+The only runtime dependency is picocolors for terminal colors; scheduling and Git operations use the Node.js standard library.
 
 ## Development
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -8,6 +9,9 @@ import { GanttCliError, GitError, RegistryError, ValidationError } from "./error
 import { AGENT_INSTRUCTIONS, installAgentInstructions } from "./agent-instructions.js";
 import {
   commonGitDir,
+  currentBranch,
+  pendingMergeSource,
+  recoverMerge,
   branchExists,
   changedPathsSince,
   commitExists,
@@ -18,6 +22,9 @@ import {
   ensureWorktreeClean,
   headCommit,
   initializeSubmodules,
+  localFiles,
+  requireClassifiedFiles,
+  safeFilePath,
   mergeBranch,
   primaryWorktree,
   registeredWorktree,
@@ -51,6 +58,7 @@ import { phaseArchive, phaseFingerprint } from "./phases.js";
 import {
   activeConflicts,
   buildSchedule,
+  coordinationFor,
   outOfScopePaths,
   renderList,
   renderSchedule,
@@ -65,7 +73,7 @@ interface ParsedArguments {
   flags: Set<string>;
 }
 
-const BOOLEAN_OPTIONS = new Set(["json", "force", "help", "install-agent-instructions", "prepare", "all"]);
+const BOOLEAN_OPTIONS = new Set(["json", "help", "install-agent-instructions", "prepare", "all"]);
 const VARIADIC_OPTIONS = new Set(["paths", "domains"]);
 const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; positionals: number }> = {
   init: { values: ["repo"], flags: ["install-agent-instructions"], positionals: 0 },
@@ -74,15 +82,17 @@ const COMMAND_OPTIONS: Record<string, { values: string[]; flags: string[]; posit
     flags: ["json"],
     positionals: 0,
   },
-  update: { values: ["repo", "add-path", "remove-path"], flags: ["force", "json"], positionals: 1 },
+  update: { values: ["repo", "add-path", "remove-path"], flags: ["json"], positionals: 1 },
   schedule: { values: ["repo"], flags: ["json"], positionals: 0 },
   start: {
-    values: ["repo", "session", "alias", "branch", "worktree-root"], flags: ["force", "json"], positionals: 1,
+    values: ["repo", "session", "alias", "branch", "worktree-root"], flags: ["json"], positionals: 1,
   },
-  repair: { values: ["repo"], flags: ["force", "json"], positionals: 1 },
+  repair: { values: ["repo"], flags: ["json"], positionals: 1 },
   merge: { values: ["repo", "into"], flags: ["json"], positionals: 1 },
+  coordinate: { values: ["repo", "plan-file"], flags: ["json"], positionals: 0 },
+  classify: { values: ["repo", "path", "reason"], flags: ["json"], positionals: 1 },
   cleanup: { values: ["repo"], flags: ["json"], positionals: 1 },
-  done: { values: ["repo"], flags: ["json"], positionals: 1 },
+  finish: { values: ["repo", "into"], flags: ["json"], positionals: 1 },
   block: { values: ["repo", "reason"], flags: [], positionals: 1 },
   unblock: { values: ["repo"], flags: [], positionals: 1 },
   release: { values: ["repo", "reason"], flags: ["json"], positionals: 1 },
@@ -346,10 +356,10 @@ function handleUpdate(args: ParsedArguments): number {
     const previousConflictAssignments = new Set(activeConflicts(state, requirement).map((item) => item.assignmentId));
     const conflicts = activeConflicts(state, { ...requirement, paths })
       .filter((item) => !previousConflictAssignments.has(item.assignmentId));
-    if (conflicts.length > 0 && !args.flags.has("force")) {
+    if (conflicts.length > 0) {
       const blockers = conflicts.map((item) => `${item.requirementId}/${item.assignmentId}`).join(", ");
       throw new ValidationError(
-        `${requirement.id} conflicts with active claims held by ${blockers}. Use --force to override advisory claims.`,
+        `${requirement.id} conflicts with active claims held by ${blockers}. Record a coordination plan to authorize overlapping work.`,
       );
     }
     const addedPaths = paths.filter((path) => !previousPaths.includes(path));
@@ -363,8 +373,6 @@ function handleUpdate(args: ParsedArguments): number {
         removedPaths: actualRemovedPaths,
         previousPaths,
         paths,
-        forced: args.flags.has("force"),
-        conflicts: args.flags.has("force") ? conflicts : [],
       },
     });
     registry.write(state);
@@ -375,6 +383,72 @@ function handleUpdate(args: ParsedArguments): number {
   });
   output(result, args.flags.has("json"));
   return 0;
+}
+
+function handleCoordinate(args: ParsedArguments): number {
+  const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const state = registry.read();
+  primaryRepository(state, currentRoot);
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(requiredOption(args, "plan-file"), "utf8")); }
+  catch (error) { throw new ValidationError(`Cannot read coordination plan: ${(error as Error).message}`); }
+  if (!raw || typeof raw !== "object") throw new ValidationError("A coordination plan must be an object.");
+  const input = raw as { members?: unknown; verify?: unknown };
+  if (!Array.isArray(input.members) || input.members.length < 2 || typeof input.verify !== "string" || !input.verify.trim()) throw new ValidationError("A plan needs at least two members in merge order and a non-empty verify command.");
+  const members = input.members.map((member: unknown) => {
+    if (!member || typeof member !== "object" || !("requirementId" in member) || !("work" in member)
+      || typeof member.requirementId !== "string" || typeof member.work !== "string" || !member.work.trim()) throw new ValidationError("Each member needs requirementId and a non-empty work description.");
+    const requirement = requirementById(state, member.requirementId);
+    if (requirement.status === "deprecated") throw new ValidationError(`Cannot coordinate deprecated ${requirement.id}.`);
+    if ("paths" in member) {
+      if (!Array.isArray(member.paths) || !member.paths.every((path) => typeof path === "string")) throw new ValidationError("Member paths must be a list of path claims.");
+      const assignment = liveAssignmentForRequirement(state, requirement.id);
+      if (!["ready", "active", "blocked"].includes(requirement.status) || (assignment && !["active", "blocked"].includes(assignment.status))) throw new ValidationError(`Cannot change coordinated paths after ${requirement.id} is merged or closed.`);
+      const previousPaths = requirement.paths;
+      requirement.paths = normalizeProjectPaths(member.paths);
+      requirement.updatedAt = utcNow();
+      appendEvent(state, "requirement.paths_updated", { requirementId: requirement.id, data: { previousPaths, paths: requirement.paths, reason: "coordination plan" } });
+    }
+    return { requirementId: requirement.id, work: member.work.trim(), paths: [...requirement.paths], domains: [...requirement.domains] };
+  });
+  const ids = members.map((member) => member.requirementId);
+  if (new Set(ids).size !== ids.length) throw new ValidationError("Coordination members must be distinct.");
+  for (const [index, member] of members.entries()) {
+    const pending = [...requirementById(state, member.requirementId).dependsOn];
+    const visited = new Set<string>();
+    while (pending.length) {
+      const dependency = pending.pop() as string;
+      if (visited.has(dependency)) continue;
+      visited.add(dependency);
+      if (ids.indexOf(dependency) > index) throw new ValidationError(`Merge order contradicts the dependency of ${member.requirementId} on ${dependency}.`);
+      pending.push(...requirementById(state, dependency).dependsOn);
+    }
+  }
+  const plan = { members, verify: input.verify.trim(), createdAt: utcNow() };
+  const replaced = state.coordinationPlans?.filter((existing) => existing.members.some((member) => ids.includes(member.requirementId))) ?? [];
+  state.coordinationPlans = [...(state.coordinationPlans ?? []).filter((existing) => !replaced.includes(existing)), plan];
+  for (const member of members) {
+    const conflicts = activeConflicts(state, requirementById(state, member.requirementId));
+    if (conflicts.length) throw new ValidationError(`Plan leaves ${member.requirementId} in conflict with active tasks outside its members: ${conflicts.map((item) => item.requirementId).join(", ")}`);
+  }
+  appendEvent(state, "coordination.recorded", { data: { plan, replaced } });
+  registry.write(state);
+  output({ plan, message: "Recorded coordination; members are listed in merge order." }, args.flags.has("json"));
+  return 0;
+}
+
+function ensureMergeOrder(state: State, requirement: Requirement, primary: string): void {
+  const declared = state.coordinationPlans?.find((plan) => plan.members.some((member) => member.requirementId === requirement.id));
+  const plan = coordinationFor(state, requirement);
+  if (declared && !plan) throw new ValidationError("Coordination scope changed; record a new plan before merging.");
+  if (!plan) return;
+  for (const member of plan.members.slice(0, plan.members.findIndex((item) => item.requirementId === requirement.id))) {
+    const previous = assignmentsForRequirement(state, member.requirementId).at(-1);
+    if (!previous || !["merged", "cleaned", "completed"].includes(previous.status) || mergeEvidenceProblem(primary, previous)
+      || (registeredWorktree(primary, previous.worktree) && headCommit(previous.worktree) !== previous.sourceCommit)) {
+      throw new ValidationError(`Merge order requires ${member.requirementId} to be merged first.`);
+    }
+  }
 }
 
 function handleSchedule(args: ParsedArguments): number {
@@ -421,10 +495,10 @@ function handleStart(args: ParsedArguments): number {
     throw new ValidationError(`${requirement.id} cannot start before: ${dependencies.join(", ")}.`);
   }
   const conflicts = activeConflicts(state, requirement);
-  if (conflicts.length > 0 && !args.flags.has("force")) {
+  if (conflicts.length > 0) {
     const blockers = conflicts.map((item) => `${item.requirementId}/${item.assignmentId}`).join(", ");
     throw new ValidationError(
-      `${requirement.id} conflicts with active claims held by ${blockers}. Use --force to override advisory claims.`,
+      `${requirement.id} conflicts with active claims held by ${blockers}. Record a coordination plan to authorize overlapping work.`,
     );
   }
 
@@ -489,6 +563,8 @@ function handleStart(args: ParsedArguments): number {
     return 4;
   }
 
+  try { assignment.localBaseline = { primary: localFiles(primary), worktree: localFiles(worktree) }; }
+  catch (error) { rollbackAndRethrow(error, primary, branch, worktree); }
   state.assignments.push(assignment);
   state.nextAssignmentNumber += 1;
   requirement.status = "active";
@@ -501,8 +577,6 @@ function handleStart(args: ParsedArguments): number {
       branch,
       worktree,
       baseCommit,
-      forced: args.flags.has("force"),
-      conflicts: args.flags.has("force") ? conflicts : [],
     },
   });
   try {
@@ -541,10 +615,10 @@ function handleRepair(args: ParsedArguments): number {
       throw new ValidationError(`${requirement.id} cannot be repaired before: ${dependencies.join(", ")}.`);
     }
     const conflicts = activeConflicts(state, requirement);
-    if (conflicts.length > 0 && !args.flags.has("force")) {
+    if (conflicts.length > 0) {
       const blockers = conflicts.map((item) => `${item.requirementId}/${item.assignmentId}`).join(", ");
       throw new ValidationError(
-        `${requirement.id} conflicts with active claims held by ${blockers}. Use --force to override advisory claims.`,
+        `${requirement.id} conflicts with active claims held by ${blockers}. Record a coordination plan to authorize overlapping work.`,
       );
     }
     verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
@@ -578,8 +652,6 @@ function handleRepair(args: ParsedArguments): number {
       assignmentId: assignment.id,
       actor: assignment.session,
       data: {
-        forced: args.flags.has("force"),
-        conflicts: args.flags.has("force") ? conflicts : [],
       },
     });
     registry.write(state);
@@ -652,24 +724,29 @@ function verifiedMergeEvidence(repository: string, assignment: Assignment): { so
   return { sourceCommit: assignment.sourceCommit as string, mergeCommit: assignment.mergeCommit as string };
 }
 
-function handleMerge(args: ParsedArguments): number {
+function handleMerge(args: ParsedArguments, quiet = false): number {
   const { registry, state, primary, requirement, assignment } = transitionRecords(args);
   if (requirement.status !== "active" || !["active", "merged"].includes(assignment.status)) {
     throw new ValidationError(`${requirement.id} must have an active or merged assignment to merge.`);
   }
+  const targetBranch = currentBranch(primary);
+  if ((option(args, "into") && option(args, "into") !== targetBranch) || (assignment.mergedInto && assignment.mergedInto !== targetBranch)) {
+    throw new GitError(`Primary worktree must be on ${JSON.stringify(assignment.mergedInto ?? option(args, "into"))}; currently on ${JSON.stringify(targetBranch)}.`);
+  }
+  ensureMergeOrder(state, requirement, primary);
   let previousSource: string | undefined;
   if (assignment.status === "merged") {
     previousSource = verifiedMergeEvidence(primary, assignment).sourceCommit;
     if (!registeredWorktree(primary, assignment.worktree)) {
-      output({ assignment, message: `${assignment.id} is already merged.` }, args.flags.has("json"));
+      if (!quiet) output({ assignment, message: `${assignment.id} is already merged.` }, args.flags.has("json"));
       return 0;
     }
   }
   verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
-  ensureWorktreeClean(assignment.worktree);
+  ensureWorktreeClean(assignment.worktree, true);
   const sourceCommit = headCommit(assignment.worktree);
   if (sourceCommit === previousSource) {
-    output({ assignment, message: `${assignment.id} is already merged.` }, args.flags.has("json"));
+    if (!quiet) output({ assignment, message: `${assignment.id} is already merged.` }, args.flags.has("json"));
     return 0;
   }
   const changedPaths = changedPathsSince(primary, assignment.baseCommit, sourceCommit);
@@ -679,7 +756,25 @@ function handleMerge(args: ParsedArguments): number {
       `Committed changes exceed ${requirement.id} path claims: ${outsideScope.join(", ")}`,
     );
   }
-  const merged = mergeBranch(primary, assignment.branch, sourceCommit, option(args, "into"));
+  const foreignPending = state.assignments.find((other) => other.id !== assignment.id && other.mergePending);
+  if (foreignPending) throw new GitError(`Pending merge belongs to ${foreignPending.requirementId}; finish it before merging another task.`);
+  if (!assignment.mergePending) {
+    if (pendingMergeSource(primary)) throw new GitError(`Resolve the existing Git merge in ${primary} before starting another merge.`);
+    ensureWorktreeClean(primary, true);
+    if (commitIsAncestor(primary, sourceCommit)) throw new GitError("Source is already in HEAD without recorded merge intent; inspect Git evidence before continuing.");
+    assignment.mergePending = { targetBranch, targetCommit: headCommit(primary), sourceCommit };
+    appendEvent(state, "assignment.merge_requested", { requirementId: requirement.id, assignmentId: assignment.id, data: assignment.mergePending });
+    registry.write(state);
+  }
+  const intent = assignment.mergePending;
+  if (intent.sourceCommit !== sourceCommit) throw new GitError("Source advanced during a pending merge; restore the intended source and recover that merge first.");
+  const recovered = recoverMerge(primary, intent);
+  const merged = recovered ? { targetBranch: intent.targetBranch, sourceCommit, mergeCommit: recovered } : mergeBranch(primary, assignment.branch, sourceCommit, intent.targetBranch);
+  const mergedOutsideScope = outOfScopePaths(requirement, changedPathsSince(primary, intent.targetCommit, merged.mergeCommit));
+  if (mergedOutsideScope.length) throw new ValidationError(`Merge resolution exceeds path claims: ${mergedOutsideScope.join(", ")}. Review scope before retrying.`);
+  delete assignment.mergePending;
+  delete assignment.verificationTarget;
+  delete assignment.verifiedCommands;
   updateAssignment(assignment, "merged");
   assignment.sourceCommit = merged.sourceCommit;
   assignment.mergedInto = merged.targetBranch;
@@ -696,26 +791,64 @@ function handleMerge(args: ParsedArguments): number {
     },
   });
   registry.write(state);
-  output({ assignment, message: `Merged ${assignment.branch} into ${merged.targetBranch}.` }, args.flags.has("json"));
+  if (!quiet) output({ assignment, message: `Merged ${assignment.branch} into ${merged.targetBranch}.` }, args.flags.has("json"));
   return 0;
 }
 
-function handleCleanup(args: ParsedArguments): number {
+function preservationDirectory(registry: Registry, assignment: Assignment): string {
+  assignment.preservationKey ??= randomUUID();
+  return safeFilePath(registry.directory, `preserved/${assignment.id}-${assignment.preservationKey}`);
+}
+
+function handleClassify(args: ParsedArguments): number {
+  const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+  const state = registry.read();
+  const primary = primaryRepository(state, currentRoot);
+  const id = args.positionals[0];
+  if (!id) throw new ValidationError("classify requires a requirement or assignment ID.");
+  const assignment = id.startsWith("ASN-") ? assignmentById(state, id) : assignmentForTransition(state, requirementById(state, id));
+  verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
+  const reason = requiredOption(args, "reason").trim();
+  if (!reason) throw new ValidationError("Classification reason cannot be empty.");
+  const requested = args.options.get("path") ?? [];
+  if (!requested.length) throw new ValidationError("classify requires at least one --path.");
+  const files = localFiles(assignment.worktree);
+  const selected = requested.flatMap((raw) => {
+    const path = raw.replace(/\/$/, "");
+    safeFilePath(assignment.worktree, path);
+    const matches = files.filter((file) => file === path || file.startsWith(`${path}/`));
+    if (!matches.length) throw new ValidationError(`No current local files match ${JSON.stringify(path)}. Tracked deliverables cannot be classified.`);
+    return matches;
+  });
+  assignment.preservePaths = [...new Set([...(assignment.preservePaths ?? []), ...selected])].sort();
+  assignment.updatedAt = utcNow();
+  appendEvent(state, "assignment.files_classified", { assignmentId: assignment.id, requirementId: assignment.requirementId, data: { paths: selected, reason } });
+  registry.write(state);
+  output({ assignment, message: `Classified ${selected.length} files for preservation; newly created files need their own classification.` }, args.flags.has("json"));
+  return 0;
+}
+
+function handleCleanup(args: ParsedArguments, quiet = false): number {
   const { registry, state, primary, requirement, assignment } = transitionRecords(args);
   if (requirement.status !== "active") {
     throw new ValidationError(`${requirement.id} must remain active until cleanup completes.`);
   }
   if (assignment.status === "cleaned") {
-    output({ assignment, message: `${assignment.id} worktree is already cleaned.` }, args.flags.has("json"));
+    if (!quiet) output({ assignment, message: `${assignment.id} worktree is already cleaned.` }, args.flags.has("json"));
     return 0;
   }
   if (assignment.status !== "merged") {
     throw new ValidationError(`${assignment.id} must be merged before cleanup.`);
   }
   const evidence = verifiedMergeEvidence(primary, assignment);
+  if (!verifyDelivery({ registry, state, primary, requirement, assignment })) {
+    if (!quiet) output({ requirement, assignment, nextAction: "fix_verification", message: "Verification failed; worktree retained." }, args.flags.has("json"));
+    return 3;
+  }
   const record = registeredWorktree(primary, assignment.worktree);
   if (!record) {
     if (assignment.cleanupPending) {
+      if (existsSync(assignment.worktree)) throw new GitError("Unregistered worktree directory still exists; preserve and inspect it before recovering cleanup.");
       updateAssignment(assignment, "cleaned");
       assignment.cleanupAt = utcNow();
       delete assignment.cleanupPending;
@@ -724,7 +857,7 @@ function handleCleanup(args: ParsedArguments): number {
         assignmentId: assignment.id,
       });
       registry.write(state);
-      output({ assignment, message: `Recovered completed cleanup for ${assignment.id}.` }, args.flags.has("json"));
+      if (!quiet) output({ assignment, message: `Recovered completed cleanup for ${assignment.id}.` }, args.flags.has("json"));
       return 0;
     }
     throw new GitError(
@@ -735,7 +868,8 @@ function handleCleanup(args: ParsedArguments): number {
   if (headCommit(assignment.worktree) !== evidence.sourceCommit) {
     throw new GitError(`Assignment branch advanced after merge: ${assignment.branch}. Run merge again before cleanup.`);
   }
-  ensureWorktreeClean(assignment.worktree);
+  ensureWorktreeClean(assignment.worktree, true);
+  assignment.preservationDirectory = preservationDirectory(registry, assignment);
   if (!assignment.cleanupPending) {
     assignment.cleanupPending = true;
     assignment.updatedAt = utcNow();
@@ -745,7 +879,12 @@ function handleCleanup(args: ParsedArguments): number {
     });
     registry.write(state);
   }
-  removeWorktree(primary, assignment.worktree);
+  removeWorktree(primary, assignment.worktree, { paths: assignment.preservePaths ?? [], directory: preservationDirectory(registry, assignment) }, () => {
+    if (currentBranch(primary) !== assignment.mergedInto || headCommit(primary) !== assignment.verificationTarget || headCommit(assignment.worktree) !== assignment.sourceCommit) {
+      throw new GitError("Target or source changed during preservation; retry finish to verify again. Worktree retained.");
+    }
+    ensureWorktreeClean(primary, true);
+  });
   updateAssignment(assignment, "cleaned");
   assignment.cleanupAt = utcNow();
   delete assignment.cleanupPending;
@@ -755,65 +894,82 @@ function handleCleanup(args: ParsedArguments): number {
     data: { worktree: assignment.worktree },
   });
   registry.write(state);
-  output({ assignment, message: `Removed worktree ${assignment.worktree}.` }, args.flags.has("json"));
+  if (!quiet) output({ assignment, message: `Removed worktree ${assignment.worktree}.` }, args.flags.has("json"));
   return 0;
 }
 
-function handleDone(args: ParsedArguments): number {
-  const { registry, state, primary, requirement, assignment } = transitionRecords(args);
-  if (requirement.status !== "active" || assignment.status !== "cleaned") {
-    throw new ValidationError(
-      `${requirement.id} must be active with a cleaned assignment before it can be done.`,
-    );
-  }
-  if (!assignment.cleanupAt) {
-    throw new GitError("Assignment cleanup has no recorded clean-worktree verification. Run cleanup again.");
-  }
-  if (registeredWorktree(primary, assignment.worktree) || existsSync(assignment.worktree)) {
-    throw new GitError("Assignment worktree still exists; run cleanup before done.");
-  }
-  const evidence = verifiedMergeEvidence(primary, assignment);
-  if (requirement.verify) {
-    const verification = spawnSync(requirement.verify, {
-      cwd: primary,
-      encoding: "utf8",
-      shell: true,
+function verifyDelivery(records: ReturnType<typeof transitionRecords>): boolean {
+  const { registry, state, primary, requirement, assignment } = records;
+  if (currentBranch(primary) !== assignment.mergedInto) throw new GitError(`Verification requires recorded target branch ${assignment.mergedInto}; restore that checkout before retrying finish.`);
+  ensureMergeOrder(state, requirement, primary);
+  const commands = [...new Set([requirement.verify, coordinationFor(state, requirement)?.verify].filter((command): command is string => Boolean(command)))];
+  const target = headCommit(primary);
+  if (pendingMergeSource(primary) || state.assignments.some((other) => other.mergePending)) throw new GitError("Resolve pending merges before verifying or cleaning up.");
+  ensureWorktreeClean(primary, true);
+  if (assignment.verificationTarget === target && JSON.stringify(assignment.verifiedCommands) === JSON.stringify(commands)) return true;
+  delete assignment.verificationTarget;
+  delete assignment.verifiedCommands;
+  for (const command of commands) {
+    const result = spawnSync(command, { cwd: primary, encoding: "utf8", shell: true });
+    assignment.verification = { command, exitCode: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr || result.error?.message || "", completedAt: utcNow() };
+    appendEvent(state, assignment.verification.exitCode ? "requirement.verification_failed" : "requirement.verified", {
+      requirementId: requirement.id, assignmentId: assignment.id, data: { command, exitCode: assignment.verification.exitCode, targetCommit: target },
     });
-    const result = {
-      command: requirement.verify,
-      exitCode: verification.status ?? 1,
-      stdout: verification.stdout,
-      stderr: verification.stderr || verification.error?.message || "",
-      completedAt: utcNow(),
-    };
-    assignment.verification = result;
-    if (result.exitCode !== 0) {
-      appendEvent(state, "requirement.verification_failed", {
-        requirementId: requirement.id,
-        assignmentId: assignment.id,
-        data: { command: result.command, exitCode: result.exitCode },
-      });
-      registry.write(state);
-      output({
-        requirement,
-        assignment,
-        nextAction: "fix_verification",
-        message: `Verification failed for ${requirement.id} with exit code ${result.exitCode}.`,
-      }, args.flags.has("json"));
+    registry.write(state);
+    if (assignment.verification.exitCode) return false;
+    if (headCommit(primary) !== target) throw new GitError("Target changed during verification; retry finish.");
+    ensureWorktreeClean(primary, true);
+  }
+  assignment.verificationTarget = target;
+  assignment.verifiedCommands = commands;
+  registry.write(state);
+  return true;
+}
+
+function handleFinish(args: ParsedArguments): number {
+  try {
+    const { currentRoot, registry } = registryFor(option(args, "repo", ".") ?? ".");
+    let state = registry.read();
+    const primary = primaryRepository(state, currentRoot);
+    let requirement = requirementById(state, args.positionals[0] ?? "");
+    if (requirement.status === "done") {
+      const assignment = assignmentsForRequirement(state, requirement.id).at(-1);
+      if (!assignment) throw new GitError("Completed requirement has no assignment evidence.");
+      verifiedMergeEvidence(primary, assignment);
+      output({ requirement, assignment, message: `${requirement.id} is already done.` }, args.flags.has("json"));
+      return 0;
+    }
+    let assignment = assignmentForTransition(state, requirement);
+    if (requirement.status !== "active") throw new ValidationError(`${requirement.id} must be active to finish.`);
+    if (["active", "merged"].includes(assignment.status)) {
+      if (registeredWorktree(primary, assignment.worktree)) requireClassifiedFiles(assignment.worktree, assignment.preservePaths ?? []);
+      handleMerge(args, true);
+      const result = handleCleanup(args, true);
+      if (result !== 0) {
+        ({ state, requirement, assignment } = transitionRecords(args));
+        output({ requirement, assignment, nextAction: "fix_verification", message: "Verification failed; fix and commit in the retained task worktree, then retry finish." }, args.flags.has("json"));
+        return result;
+      }
+    }
+    ({ state, requirement, assignment } = transitionRecords(args));
+    if (assignment.status !== "cleaned" || !assignment.cleanupAt || registeredWorktree(primary, assignment.worktree) || existsSync(assignment.worktree)) throw new GitError("Cleanup is incomplete; retry finish after resolving the reported problem.");
+    const evidence = verifiedMergeEvidence(primary, assignment);
+    if (!verifyDelivery({ registry, state, primary, requirement, assignment })) {
+      output({ requirement, assignment, nextAction: "fix_verification", message: "Target verification failed; retry finish after fixing the target." }, args.flags.has("json"));
       return 3;
     }
+    updateAssignment(assignment, "completed");
+    assignment.completedAt = utcNow();
+    updateRequirement(requirement, "done");
+    appendEvent(state, "requirement.done", { requirementId: requirement.id, assignmentId: assignment.id, data: evidence });
+    registry.write(state);
+    output({ requirement, assignment, nextAction: "none", message: `Completed ${requirement.id}.${assignment.verifiedCommands?.length ? "" : " No project verification command was configured."}${assignment.preservationDirectory ? ` Preserved files: ${assignment.preservationDirectory}` : ""}` }, args.flags.has("json"));
+    return 0;
+  } catch (error) {
+    if (!(error instanceof GanttCliError) || !args.flags.has("json")) throw error;
+    output({ nextAction: "resolve_and_retry_finish", message: error.message }, true);
+    return 2;
   }
-  updateAssignment(assignment, "completed");
-  assignment.completedAt = utcNow();
-  updateRequirement(requirement, "done");
-  appendEvent(state, "requirement.done", {
-    requirementId: requirement.id,
-    assignmentId: assignment.id,
-    data: evidence,
-  });
-  registry.write(state);
-  output({ requirement, assignment, message: `Completed ${requirement.id}.` }, args.flags.has("json"));
-  return 0;
 }
 
 function requiredRequirementId(args: ParsedArguments): string {
@@ -890,10 +1046,11 @@ function handleRelease(args: ParsedArguments): number {
     const state = registry.read();
     const requirement = requirementById(state, identifier);
     const assignment = assignmentForTransition(state, requirement);
+    if (assignment.mergePending) throw new ValidationError("Recover the pending merge with finish before releasing this assignment.");
     if (!["active", "blocked"].includes(requirement.status)
       || !["active", "blocked"].includes(assignment.status)) {
       throw new ValidationError(
-        "Only an active or blocked assignment can be released; merged work must use cleanup/done.",
+        "Only an active or blocked assignment can be released; merged work must use finish.",
       );
     }
     updateAssignment(assignment, "released");
@@ -942,7 +1099,9 @@ function handleDiscard(args: ParsedArguments): number {
       recovered = true;
     } else {
       verifyAssignmentWorktree(primary, assignment.worktree, assignment.branch, commonGitDir(primary));
-      removeWorktree(primary, assignment.worktree);
+      assignment.preservationDirectory = preservationDirectory(registry, assignment);
+      registry.write(state);
+      removeWorktree(primary, assignment.worktree, { paths: assignment.preservePaths ?? [], directory: preservationDirectory(registry, assignment) });
     }
     if (!assignment.releasedAt) assignment.releasedAt = utcNow();
     updateAssignment(assignment, "discarded");
@@ -1201,6 +1360,7 @@ function handleArchive(args: ParsedArguments): number {
     state.phases.push(phase);
     state.nextPhaseNumber += 1;
     state.requirements = [];
+    state.coordinationPlans = [];
     state.assignments = [];
     state.events = [];
     state.nextRequirementNumber = 1;
@@ -1319,6 +1479,7 @@ function doctorIssues(currentRoot: string, state: State, registry: Registry): Do
   for (const assignment of state.assignments) {
     const status = assignment.status;
     const record = registeredWorktree(primary, assignment.worktree);
+    if (assignment.mergePending) issues.push({ severity: "warning", code: "merge_recovery", assignmentId: assignment.id, message: `Pending merge into ${assignment.mergePending.targetBranch}; resolve any conflict in ${primary} and retry finish ${assignment.requirementId}.` });
     const branchMissing = ["active", "blocked"].includes(status) && !branchExists(primary, assignment.branch);
     if (branchMissing) {
       issues.push({
@@ -1448,8 +1609,10 @@ const COMMAND_SUMMARIES: Record<string, string> = {
   start: "Allocate a branch and linked worktree.",
   repair: "Retry a retained provisioning-failed assignment.",
   merge: "Merge an assignment branch into the primary worktree.",
+  coordinate: "Record member work, merge order, and integrated verification.",
+  classify: "Classify current local files for preservation before removal.",
   cleanup: "Remove a clean, merged assignment worktree.",
-  done: "Verify and complete a requirement.",
+  finish: "Merge, verify, preserve files, clean up, and complete; safe to retry.",
   block: "Block a ready or active requirement.",
   unblock: "Restore a blocked requirement.",
   release: "Release an assignment while retaining its worktree.",
@@ -1470,8 +1633,9 @@ const COMMAND_POSITIONALS: Record<string, string> = {
   start: "<requirement-id>",
   repair: "<assignment-id>",
   merge: "<requirement-id>",
+  classify: "<requirement-or-assignment-id>",
   cleanup: "<requirement-id>",
-  done: "<requirement-id>",
+  finish: "<requirement-id>",
   block: "<requirement-id>",
   unblock: "<requirement-id>",
   release: "<requirement-id>",
@@ -1483,9 +1647,10 @@ const COMMAND_POSITIONALS: Record<string, string> = {
 };
 
 const OPTION_HELP: Record<string, { usage: string; description: string }> = {
+  "plan-file": { usage: "--plan-file <json-file>", description: "Plan with ordered members [{requirementId, work}] and verify command." },
   repo: { usage: "--repo <path>", description: "Git repository; defaults to the current directory." },
   request: { usage: "--request <text>", description: "Requirement text; required." },
-  verify: { usage: "--verify <command>", description: "Shell command that must pass before done." },
+  verify: { usage: "--verify <command>", description: "Shell command that must pass before cleanup and completion." },
   priority: { usage: "--priority <p0|p1|p2|p3>", description: "Planning priority; defaults to p2." },
   points: { usage: "--points <number>", description: "Effort from 1 to 100; defaults to 3." },
   "depends-on": { usage: "--depends-on <id>", description: "Required predecessor; repeatable." },
@@ -1509,7 +1674,6 @@ const OPTION_HELP: Record<string, { usage: string; description: string }> = {
   "summary-file": { usage: "--summary-file <path>", description: "Non-empty Markdown summary to store in the phase." },
   fingerprint: { usage: "--fingerprint <sha256>", description: "State fingerprint returned by archive --prepare." },
   json: { usage: "--json", description: "Print machine-readable JSON." },
-  force: { usage: "--force", description: "Override advisory active-claim conflicts." },
   prepare: { usage: "--prepare", description: "Return the immutable commit manifest for Agent summarization." },
   all: { usage: "--all", description: "Include closed requirements in the table." },
   "install-agent-instructions": {
@@ -1526,7 +1690,9 @@ function renderCommandHelp(command: string): string {
   const usage = [`Usage: gantt-cli ${command}`, positional, "[options]"].filter(Boolean).join(" ");
   const optionNames = [...contract.values, ...contract.flags, "help"];
   const options = optionNames.map((name) => {
-    const help = OPTION_HELP[name];
+    const help = command === "classify" && name === "path"
+      ? { usage: "--path <file-or-directory>", description: "Current local files to preserve; repeatable, not a glob." }
+      : OPTION_HELP[name];
     if (!help) throw new ValidationError(`Help is missing for option --${name}.`);
     return `  ${help.usage.padEnd(34)}${help.description}`;
   });
@@ -1542,11 +1708,13 @@ Commands:
   add                 Register a requirement
   update              Update a requirement's path claims
   schedule            Show stable greedy batches and deferrals
+  coordinate          Record a plan for overlapping tasks
+  classify            Preserve current local files before cleanup
   start               Allocate a branch and linked worktree
   repair              Retry a retained provisioning-failed assignment
   merge               Merge an assignment branch into the primary worktree
   cleanup             Remove a clean, merged assignment worktree
-  done                Verify and complete a requirement
+  finish              Merge, verify, preserve, clean up, and complete
   block               Block a ready or active requirement
   unblock             Restore a blocked requirement
   release             Release an assignment while retaining its worktree
@@ -1607,8 +1775,10 @@ function main(arguments_ = process.argv.slice(2)): number {
     start: withCommandLock(handleStart),
     repair: handleRepair,
     merge: withCommandLock(handleMerge),
+    coordinate: withCommandLock(handleCoordinate),
+    classify: withCommandLock(handleClassify),
     cleanup: withCommandLock(handleCleanup),
-    done: withCommandLock(handleDone),
+    finish: withCommandLock(handleFinish),
     block: handleBlock,
     unblock: handleUnblock,
     release: handleRelease,
