@@ -1529,6 +1529,7 @@ test("finish resumes a manually resolved Git conflict using recorded merge inten
     writeFileSync(join(project.repository, "README.md"), "primary heading\n");
     git(project.repository, "add", "README.md"); git(project.repository, "commit", "-m", "primary change");
     assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository, "--json").status, 2);
+    assert.equal(invoke("release", "REQ-0001", "--repo", project.repository, "--reason", "interrupted").status, 2);
     writeFileSync(join(project.repository, "README.md"), "combined heading\n");
     git(project.repository, "add", "README.md"); git(project.repository, "-c", "core.editor=true", "merge", "--continue");
     const resolvedHead = git(project.repository, "rev-parse", "HEAD");
@@ -1637,5 +1638,45 @@ test("inline upgrade rehearsal preserves original unrelated edits while starting
     assert.equal(readFileSync(join(project.repository, "local.env"), "utf8"), "user settings\n");
     assert.equal(readFileSync(join(assignment.worktree, "feature.txt"), "utf8"), "work completed inline\n");
     assert.ok(assignment.localBaseline.primary.includes("local.env"));
+  } finally { project.cleanup(); }
+});
+
+test("preservation refuses an invalid destination and completes after it is repaired", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    writeFileSync(join(assignment.worktree, "private.env"), "retained\n");
+    assert.equal(invoke("classify", "REQ-0001", "--repo", project.repository, "--path", "private.env", "--reason", "local settings").status, 0);
+    const destination = join(project.repository, ".git", "gantt-cli", "preserved");
+    writeFileSync(destination, "existing unrelated file\n");
+    const failed = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(failed.status, 2);
+    assert.match(failed.stdout, /non-directory parent/);
+    assert.equal(readFileSync(join(assignment.worktree, "private.env"), "utf8"), "retained\n");
+    assert.equal(readFileSync(destination, "utf8"), "existing unrelated file\n");
+    renameSync(destination, `${destination}.original`);
+    const completed = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(completed.status, 0, completed.stdout || completed.stderr);
+    assert.equal(readFileSync(join(JSON.parse(completed.stdout).assignment.preservationDirectory, "private.env"), "utf8"), "retained\n");
+  } finally { project.cleanup(); }
+});
+
+test("classification captures current files and refuses traversal and tracked deliverables", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    mkdirSync(join(assignment.worktree, "notes"));
+    writeFileSync(join(assignment.worktree, "notes", "one.txt"), "keep\n");
+    for (const path of ["../outside", ".git/config", "src/change.ts"]) {
+      assert.equal(invoke("classify", "REQ-0001", "--repo", project.repository, "--path", path, "--reason", "local").status, 2);
+    }
+    assert.equal(invoke("classify", "REQ-0001", "--repo", project.repository, "--path", "notes", "--reason", "local notes").status, 0);
+    writeFileSync(join(assignment.worktree, "notes", "new.ts"), "new deliverable\n");
+    const blocked = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(blocked.status, 2);
+    assert.match(blocked.stdout, /notes\/new.ts/);
+    assert.equal(exists(assignment.worktree), true);
   } finally { project.cleanup(); }
 });

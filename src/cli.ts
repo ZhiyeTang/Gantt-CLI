@@ -1038,6 +1038,7 @@ function handleRelease(args: ParsedArguments): number {
     const state = registry.read();
     const requirement = requirementById(state, identifier);
     const assignment = assignmentForTransition(state, requirement);
+    if (assignment.mergePending) throw new ValidationError("Recover the pending merge with finish before releasing this assignment.");
     if (!["active", "blocked"].includes(requirement.status)
       || !["active", "blocked"].includes(assignment.status)) {
       throw new ValidationError(
