@@ -2,25 +2,25 @@
 
 [English](./README.md) | 简体中文
 
-**一个按任务需要选择流程的 Coding Agent 调度器。**
+**Coding Agent 的任务调度与交付工具。**
 
-> 轻量任务直接 inline 完成；需要协作或隔离的任务使用独立 worktree，记录协调计划，并以一个可重试的命令完成交付。
+> 简单任务直接完成，复杂任务有序协作。分工清晰，交付可验证。
 
 <p align="center">
   <img src="./assets/gantt-cli-demo.gif" alt="Gantt-CLI 将任务调度到独立的 Git worktree，并验证交付结果" width="900" />
 </p>
 
-Coding Agent 很快，协调不是。
+Agent 写代码很快，让它们协同工作却并不简单。
 
 当多个 Agent 同时改一个仓库时，真正麻烦的通常不是生成代码，而是：谁负责什么、哪些任务会改到同一批文件、分支是否已经合并、失败后该从哪里继续。
 
 Gantt-CLI 把这些问题变成一个基于 Git branch 和 worktree 的本地工作流。它不需要 daemon、数据库或云服务；`doctor` 用于诊断状态漂移，`repair` 用于重试 provisioning 失败后保留的 worktree。
 
-> `0.1.0-alpha.0` 是首个 alpha 版本。命令和状态格式仍可能调整。
+> Gantt-CLI 目前处于 alpha 阶段，命令和状态格式仍可能调整。
 
 ## TL;DR
 
-Gantt-CLI 为 Coding Agent 提供隔离的 worktree、明确的文件所有权、依赖感知调度，以及一条从计划任务到合并代码的可验证路径。它完全在本地运行，可脚本化、可恢复，让多个 Agent 无需共享同一个可变工作目录。
+Gantt-CLI 让 Coding Agent 直接完成轻量任务，在独立的 Git worktree 中协作处理复杂任务。通过任务范围、依赖和协调计划安排并行工作，用一个可重试的命令完成合并、验证、文件保全和清理。所有操作都在本地运行，Agent 和脚本可以随时查询状态、恢复执行。
 
 ## 安装（30 秒）
 
@@ -52,7 +52,7 @@ gantt-cli --help
 
 ## 为什么需要 Gantt-CLI
 
-### 并行工作需要明确所有权
+### 并行工作需要明确分工
 
 “你改后端，我改前端”并不足以避免冲突。Gantt-CLI 用显式 `--path` 模式和可选的 `--domain` 声明识别重叠工作，并解释任务为什么能并行或必须等待。
 
@@ -62,7 +62,7 @@ Agent 会退出，终端会关闭，上下文会丢失。Gantt-CLI 把 requireme
 
 ### “实现了”不等于“交付了”
 
-一个 requirement 只有在提交已经合并、worktree 已清理、验证命令通过后，才能进入 `done`。完成状态来自仓库事实，而不是 Agent 的一句声明。
+一个 requirement 只有在提交已经合并、配置的验证命令通过、worktree 已清理后，才能进入 `done`。完成状态来自仓库事实，而不是 Agent 的一句声明。
 
 ## 工作方式
 
@@ -88,11 +88,11 @@ deprecated
 
 调度器只会选择依赖已完成、scope 不冲突或已有有效协调计划且当前可执行的 requirement。使用 `--json` 可以获得适合 Agent 和脚本消费的结构化输出。
 
-## Quick start
+## 快速开始
 
 ### 先判断是否需要登记
 
-Agent 自行判断并简述理由：范围明确、低风险、可直接验证的任务 inline 完成，不登记、不创建 worktree。文件数量不是硬门槛。执行中出现协作、依赖协调或隔离需要时自动升级：先记录原工作区状态，只转移本任务改动，核对新 worktree 后再移除原目录中对应改动，保留其他已有修改。归属不清时保留原状并报告歧义。
+Agent 自行判断并简述理由：范围明确、低风险、可直接验证的任务直接在当前工作区完成（inline），不登记、不创建 worktree。文件数量不是硬门槛。执行中出现协作、依赖协调或隔离需要时自动升级：先记录原工作区状态，只转移本任务改动，核对新 worktree 后再移除原目录中对应改动，保留其他已有修改。归属不清时保留原状并报告歧义。
 
 下面的步骤用于受管任务。
 
@@ -140,7 +140,7 @@ npx gantt-cli@latest finish REQ-0001 --json
 
 #### 本地文件保护
 
-任务开始时记录主目录和任务 worktree 的本地文件列表。无关未跟踪文件可以留在主目录；会被覆盖的文件仍会阻止合并。记录是来源证据，文件名和 ignored 状态都不代表可以删除。
+任务开始时记录主目录和任务 worktree 的本地文件列表。无关未跟踪文件可以留在主目录；会被覆盖的文件仍会阻止合并。记录只说明文件来源，不代表可以删除；文件名和是否被 Git 忽略也不能决定文件归属。
 
 应交付的源码正常提交。需要保留的配置、笔记、构建结果或依赖内容，先显式分类：
 
@@ -155,7 +155,7 @@ npx gantt-cli@latest finish REQ-0001 --json
 
 #### 同文件并行
 
-Agent 可提交以下 `plan.json`，成员数组的顺序就是合并顺序：
+Agent 可记录以下 `plan.json`，成员数组的顺序就是合并顺序：
 
 ```json
 {
@@ -172,7 +172,7 @@ npx gantt-cli@latest coordinate --plan-file plan.json
 npx gantt-cli@latest schedule --json
 ```
 
-有效计划允许同模块或同文件在不同 worktree 同时开发，无需用户逐次授权。合并依次进行，每项收口都运行任务验证和计划的整体验证。真实 `--depends-on` 仍约束启动；仅需控制合并次序时使用计划，不添加启动依赖。示例 Quick start 中的 UI 任务有真实依赖，记录计划不会解除它。
+有效计划允许同模块或同文件在不同 worktree 同时开发，无需用户逐次授权。合并依次进行，每项收口都运行任务验证和计划的整体验证。真实 `--depends-on` 仍约束启动；仅需控制合并次序时使用计划，不添加启动依赖。快速开始示例中的 UI 任务有真实依赖，记录计划不会解除它。
 
 范围变化时重新提交计划；成员可用可选 `paths` 数组同时明确新声明，避免先放宽范围再补记录。计划不能覆盖未列入的任务。新的计划会替换所有与其成员相交的旧计划；若仍要保留其他成员的协调，需把他们一并列入新计划。旧 `--force` 放行方式已移除。
 
@@ -186,7 +186,7 @@ npx gantt-cli@latest repair ASN-0001
 
 ### 4. 归档 Phase
 
-归档由用户显式触发，并且是全有或全无的操作。当前所有 requirement 必须为 `done` 或 `deprecated`，且不能遗留 assignment worktree。首先让 gantt-cli 生成不可变的 commit manifest：
+归档需显式触发，并且是全有或全无的操作。当前所有 requirement 必须为 `done` 或 `deprecated`，且不能遗留 assignment worktree。首先让 gantt-cli 生成不可变的 commit manifest：
 
 ```bash
 npx gantt-cli@latest archive --prepare --json
@@ -212,7 +212,7 @@ npx gantt-cli@latest archive \
 | `schedule` | 选择可并行工作并解释阻塞原因 |
 | `start` | 创建 branch、worktree 和 assignment |
 | `merge` | 将 assignment 合并到目标分支 |
-| `cleanup` | 删除干净且已合并 assignment 的 worktree |
+| `cleanup` | 验证已合并的工作、保全已分类文件并删除 worktree |
 | `finish` | 合并、验证、保全文件、清理并标记完成；可重试 |
 | `classify` | 声明要保留的当前本地文件 |
 | `coordinate` | 记录分工、合并顺序及整体验证 |
@@ -271,7 +271,7 @@ npx gantt-cli@latest agent-instructions
 - Node.js 20 或更高版本
 - Git 仓库至少有一个 commit
 - scope 冲突来自显式 `--path` 和 `--domain` 声明，不会预测语义或运行时冲突
-- `0.1.0-alpha.0` 阶段暂不保证状态格式向后兼容
+- alpha 阶段暂不保证状态格式向后兼容
 
 运行时仅使用现有的 picocolors 提供终端颜色；调度和 Git 操作使用 Node.js 标准库。
 
@@ -289,6 +289,6 @@ Alpha 版本统一发布到 `latest` dist-tag：
 npm run release:alpha
 ```
 
-## License
+## 许可证
 
 [MIT](./LICENSE)

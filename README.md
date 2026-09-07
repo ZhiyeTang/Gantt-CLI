@@ -2,9 +2,9 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-**A task-aware scheduler for coding agents.**
+**Task scheduling and delivery for coding agents.**
 
-> Complete lightweight work inline. Use isolated worktrees for collaboration or experimentation, record coordination, and finish managed work with one retryable command.
+> Keep simple tasks simple and complex work coordinated. Clear responsibilities, verifiable delivery.
 
 <p align="center">
   <img src="./assets/gantt-cli-demo.gif" alt="Gantt-CLI schedules requirements into isolated Git worktrees and verifies delivery" width="900" />
@@ -16,11 +16,11 @@ When several agents work in the same repository, the hard part is rarely generat
 
 Gantt-CLI turns those concerns into a local workflow built on Git branches and worktrees. It needs no daemon, database, or hosted service; `doctor` diagnoses state drift, while `repair` retries retained worktrees after provisioning failures.
 
-> `0.1.0-alpha.0` is the first alpha release. Commands and the state format may still change.
+> Gantt-CLI is in alpha. Commands and the state format may still change.
 
 ## TL;DR
 
-Gantt-CLI gives coding agents isolated worktrees, explicit file ownership, dependency-aware scheduling, and a verifiable path from planned work to merged code. It is local, scriptable, recoverable, and designed to let multiple agents work in one repository without sharing a mutable checkout.
+Gantt-CLI lets coding agents complete lightweight tasks directly and coordinate complex work in isolated Git worktrees. Declared scopes, dependencies, and coordination plans guide parallel work; one retryable command handles merging, verification, file preservation, and cleanup. Everything runs locally, with state that agents and scripts can inspect and resume.
 
 ## Installation (30 seconds)
 
@@ -52,7 +52,7 @@ gantt-cli --help
 
 ## Why Gantt-CLI exists
 
-### Parallel work needs ownership
+### Parallel work needs clear responsibilities
 
 “You take the backend, I will take the frontend” is not enough to prevent collisions. Gantt-CLI uses declared `--path` patterns and optional `--domain` claims to identify overlapping work and explain why tasks can run together or must wait.
 
@@ -62,7 +62,7 @@ Agents exit, terminals close, and context disappears. Gantt-CLI records requirem
 
 ### “Implemented” is not the same as “delivered”
 
-A requirement cannot become `done` until its commit is merged, its worktree is cleaned up, and its verification command passes. Completion comes from repository facts, not an agent's claim.
+A requirement cannot become `done` until its commit is merged, its configured verification command passes, and its worktree is cleaned up. Completion comes from repository facts, not an agent's claim.
 
 ## How it works
 
@@ -212,7 +212,7 @@ The result is an immutable `PHASE-001`. Current requirement, assignment, and eve
 | `schedule` | Select parallel work and explain blocked requirements |
 | `start` | Create a branch, worktree, and assignment |
 | `merge` | Merge an assignment into the target branch |
-| `cleanup` | Remove a clean, merged assignment's worktree |
+| `cleanup` | Verify merged work, preserve classified files, and remove its worktree |
 | `finish` | Merge, verify, preserve files, clean up, and complete; retryable |
 | `classify` | Identify current local files to preserve |
 | `coordinate` | Record work division, merge order, and integrated verification |
@@ -271,7 +271,7 @@ Installation preserves existing `AGENTS.md` content. It manages only a marked bl
 - Node.js 20 or newer
 - A Git repository with at least one commit
 - Scope conflicts come from explicit `--path` and `--domain` claims; semantic or runtime conflicts are not predicted
-- State-format compatibility is not guaranteed during the `0.1.0-alpha.0` release
+- State-format compatibility is not guaranteed during alpha
 
 The only runtime dependency is picocolors for terminal colors; scheduling and Git operations use the Node.js standard library.
 
