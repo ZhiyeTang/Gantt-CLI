@@ -1680,3 +1680,80 @@ test("classification captures current files and refuses traversal and tracked de
     assert.equal(exists(assignment.worktree), true);
   } finally { project.cleanup(); }
 });
+
+test("deinitialized submodule local files block removal and can be classified for preservation", () => {
+  const project = fixture();
+  const submodule = fixture();
+  const protocols = process.env.GIT_ALLOW_PROTOCOL;
+  try {
+    git(project.repository, "-c", "protocol.file.allow=always", "submodule", "add", submodule.repository, "vendor/sample");
+    git(project.repository, "commit", "-am", "add submodule");
+    process.env.GIT_ALLOW_PROTOCOL = "file";
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    git(assignment.worktree, "submodule", "deinit", "-f", "vendor/sample");
+    writeFileSync(join(assignment.worktree, "vendor/sample/private.env"), "only copy\n");
+    assert.equal(git(assignment.worktree, "status", "--porcelain"), "");
+    const blocked = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(blocked.status, 2);
+    assert.equal(readFileSync(join(assignment.worktree, "vendor/sample/private.env"), "utf8"), "only copy\n");
+    const classified = invoke("classify", "REQ-0001", "--repo", project.repository, "--path", "vendor/sample", "--reason", "local submodule config");
+    assert.equal(classified.status, 0, classified.stderr);
+    const finished = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(finished.status, 0, finished.stdout || finished.stderr);
+    assert.equal(readFileSync(join(JSON.parse(finished.stdout).assignment.preservationDirectory, "vendor/sample/private.env"), "utf8"), "only copy\n");
+  } finally {
+    if (protocols === undefined) delete process.env.GIT_ALLOW_PROTOCOL; else process.env.GIT_ALLOW_PROTOCOL = protocols;
+    project.cleanup(); submodule.cleanup();
+  }
+});
+
+test("finish verifies only the recorded target branch, including merged retries", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { verify: "test -f only-other" });
+    commitFile(assignment, "src/change.ts");
+    assert.equal(invoke("merge", "REQ-0001", "--repo", project.repository).status, 0);
+    git(project.repository, "checkout", "-b", "other");
+    writeFileSync(join(project.repository, "only-other"), "not on main\n");
+    git(project.repository, "add", "only-other"); git(project.repository, "commit", "-m", "other-only verification input");
+    for (const extra of [[], ["--into", "main"]]) {
+      const wrong = invoke("finish", "REQ-0001", "--repo", project.repository, "--json", ...extra);
+      assert.equal(wrong.status, 2, wrong.stdout);
+      assert.equal(exists(assignment.worktree), true);
+    }
+    git(project.repository, "checkout", "main");
+    assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository, "--json").status, 3);
+    assert.equal(exists(assignment.worktree), true);
+  } finally { project.cleanup(); }
+});
+
+test("target advances during file preservation without losing the task worktree", async () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { path: "**", verify: "node verify.cjs" });
+    const childCode = `
+      const fs = require('node:fs'); const {execFileSync} = require('node:child_process'); const path = require('node:path');
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (Date.now() - started > 10000 || !fs.existsSync('.git/gantt-cli/state.json')) process.exit(1);
+        const record = JSON.parse(fs.readFileSync('.git/gantt-cli/state.json','utf8')).assignments[0];
+        if (!record.preservationDirectory || !fs.existsSync(path.join(record.preservationDirectory,'large.bin'))) return;
+        clearInterval(timer);
+        fs.writeFileSync('README.md','changed target\\n');
+        execFileSync('git',['add','README.md']); execFileSync('git',['commit','-m','advance during preservation']);
+      }, 1);
+    `;
+    commitFile(assignment, "verify.cjs", `const fs=require('node:fs'); if(fs.readFileSync('README.md','utf8').includes('changed target')) process.exit(7); require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{cwd:process.cwd(),detached:true,stdio:'ignore'}).unref();\n`);
+    writeFileSync(join(assignment.worktree, "large.bin"), Buffer.alloc(128 * 1024 * 1024, 120));
+    assert.equal(invoke("classify", "REQ-0001", "--repo", project.repository, "--path", "large.bin", "--reason", "local binary output").status, 0);
+    const first = await invokeAsync("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(first.status, 2, first.stdout || first.stderr);
+    assert.equal(exists(assignment.worktree), true);
+    // Wait for the deliberately concurrent Git commit before retrying.
+    for (let attempt = 0; attempt < 100 && git(project.repository, "log", "-1", "--format=%s").trim() !== "advance during preservation"; attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const second = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(second.status, 3, second.stdout || second.stderr);
+    assert.equal(exists(assignment.worktree), true);
+  } finally { project.cleanup(); }
+});

@@ -729,6 +729,10 @@ function handleMerge(args: ParsedArguments, quiet = false): number {
   if (requirement.status !== "active" || !["active", "merged"].includes(assignment.status)) {
     throw new ValidationError(`${requirement.id} must have an active or merged assignment to merge.`);
   }
+  const targetBranch = currentBranch(primary);
+  if ((option(args, "into") && option(args, "into") !== targetBranch) || (assignment.mergedInto && assignment.mergedInto !== targetBranch)) {
+    throw new GitError(`Primary worktree must be on ${JSON.stringify(assignment.mergedInto ?? option(args, "into"))}; currently on ${JSON.stringify(targetBranch)}.`);
+  }
   ensureMergeOrder(state, requirement, primary);
   let previousSource: string | undefined;
   if (assignment.status === "merged") {
@@ -754,8 +758,6 @@ function handleMerge(args: ParsedArguments, quiet = false): number {
   }
   const foreignPending = state.assignments.find((other) => other.id !== assignment.id && other.mergePending);
   if (foreignPending) throw new GitError(`Pending merge belongs to ${foreignPending.requirementId}; finish it before merging another task.`);
-  const targetBranch = currentBranch(primary);
-  if (option(args, "into") && option(args, "into") !== targetBranch) throw new GitError(`Primary worktree is on ${JSON.stringify(targetBranch)}, not requested target ${JSON.stringify(option(args, "into"))}.`);
   if (!assignment.mergePending) {
     if (pendingMergeSource(primary)) throw new GitError(`Resolve the existing Git merge in ${primary} before starting another merge.`);
     ensureWorktreeClean(primary, true);
@@ -877,7 +879,12 @@ function handleCleanup(args: ParsedArguments, quiet = false): number {
     });
     registry.write(state);
   }
-  removeWorktree(primary, assignment.worktree, { paths: assignment.preservePaths ?? [], directory: preservationDirectory(registry, assignment) });
+  removeWorktree(primary, assignment.worktree, { paths: assignment.preservePaths ?? [], directory: preservationDirectory(registry, assignment) }, () => {
+    if (currentBranch(primary) !== assignment.mergedInto || headCommit(primary) !== assignment.verificationTarget || headCommit(assignment.worktree) !== assignment.sourceCommit) {
+      throw new GitError("Target or source changed during preservation; retry finish to verify again. Worktree retained.");
+    }
+    ensureWorktreeClean(primary, true);
+  });
   updateAssignment(assignment, "cleaned");
   assignment.cleanupAt = utcNow();
   delete assignment.cleanupPending;
@@ -893,6 +900,7 @@ function handleCleanup(args: ParsedArguments, quiet = false): number {
 
 function verifyDelivery(records: ReturnType<typeof transitionRecords>): boolean {
   const { registry, state, primary, requirement, assignment } = records;
+  if (currentBranch(primary) !== assignment.mergedInto) throw new GitError(`Verification requires recorded target branch ${assignment.mergedInto}; restore that checkout before retrying finish.`);
   ensureMergeOrder(state, requirement, primary);
   const commands = [...new Set([requirement.verify, coordinationFor(state, requirement)?.verify].filter((command): command is string => Boolean(command)))];
   const target = headCommit(primary);

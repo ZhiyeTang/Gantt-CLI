@@ -306,7 +306,7 @@ function nestedRepositoriesStoredInside(worktree: string): { repository: string;
   return nested;
 }
 
-export function removeWorktree(repository: string, worktree: string, preservation?: { paths: string[]; directory: string }): void {
+export function removeWorktree(repository: string, worktree: string, preservation?: { paths: string[]; directory: string }, verifyBeforeRemoval?: () => void): void {
   ensureWorktreeClean(worktree, true);
   const nested = nestedRepositoriesStoredInside(worktree);
   if (nested.length > 0) {
@@ -337,6 +337,7 @@ export function removeWorktree(repository: string, worktree: string, preservatio
     }
   }
   ensureWorktreeClean(worktree, true);
+  verifyBeforeRemoval?.();
   runGit(repository, ["worktree", "remove", "--force", worktree]);
 }
 
@@ -345,9 +346,21 @@ export function localFiles(worktree: string): string[] {
   const repositories = ["", ...runGit(worktree, ["submodule", "foreach", "--quiet", "--recursive", "printf '%s\\0' \"$displaypath\" "]).split("\0").filter(Boolean)];
   return [...new Set(repositories.flatMap((prefix) => {
     const root = join(worktree, prefix);
-    return [false, true].flatMap((ignored) => runGit(root, ["ls-files", "--others", "--exclude-standard", "-z", ...(ignored ? ["--ignored"] : [])])
+    const files = [false, true].flatMap((ignored) => runGit(root, ["ls-files", "--others", "--exclude-standard", "-z", ...(ignored ? ["--ignored"] : [])])
       .split("\0").filter(Boolean).map((path) => (prefix ? `${prefix}/${path}` : path).replace(/\/$/, "")));
+    const gitlinks = runGit(root, ["ls-files", "--stage", "-z"]).split("\0").filter((entry) => entry.startsWith("160000 "))
+      .map((entry) => [prefix, entry.slice(entry.indexOf("\t") + 1)].filter(Boolean).join("/"));
+    for (const path of gitlinks.filter((path) => !repositories.includes(path))) files.push(...uninitializedFiles(worktree, path));
+    return files;
   }))].sort();
+}
+
+function uninitializedFiles(worktree: string, path: string): string[] {
+  const absolute = safeFilePath(worktree, path);
+  const metadata = lstatSync(absolute, { throwIfNoEntry: false });
+  if (!metadata) return [];
+  if (!metadata.isDirectory()) return [path];
+  return readdirSync(absolute).flatMap((name) => uninitializedFiles(worktree, `${path}/${name}`));
 }
 
 export function safeFilePath(root: string, path: string): string {
