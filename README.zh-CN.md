@@ -2,9 +2,9 @@
 
 [English](./README.md) | 简体中文
 
-**一个面向 Coding Agent 的 worktree-first 调度器。**
+**一个按任务需要选择流程的 Coding Agent 调度器。**
 
-> **Worktree-first 开发：** 在 Agent 修改任何文件之前，先为每项工作创建独立的 branch 和 worktree。默认隔离、显式协调，并以 Git 事实验证完成状态。
+> 轻量任务直接 inline 完成；需要协作或隔离的任务使用独立 worktree，记录协调计划，并以一个可重试的命令完成交付。
 
 <p align="center">
   <img src="./assets/gantt-cli-demo.gif" alt="Gantt-CLI 将任务调度到独立的 Git worktree，并验证交付结果" width="900" />
@@ -84,11 +84,17 @@ blocked  blocked
 deprecated
 ```
 
-解除阻塞后，requirement 会回到 `ready` 或 `active`。验证失败时，它会保持 `active`，assignment 保持 `cleaned`；修复问题后可重新运行 `done`。
+解除阻塞后，requirement 会回到 `ready` 或 `active`。验证失败时，它会保持 `active`，assignment 保持 `merged` 且 worktree 保留；在任务 worktree 修复并提交后，重新运行 `finish`。
 
-调度器只会选择依赖已完成、scope 不冲突且当前可执行的 requirement。使用 `--json` 可以获得适合 Agent 和脚本消费的结构化输出。
+调度器只会选择依赖已完成、scope 不冲突或已有有效协调计划且当前可执行的 requirement。使用 `--json` 可以获得适合 Agent 和脚本消费的结构化输出。
 
 ## Quick start
+
+### 先判断是否需要登记
+
+Agent 自行判断并简述理由：范围明确、低风险、可直接验证的任务 inline 完成，不登记、不创建 worktree。文件数量不是硬门槛。执行中出现协作、依赖协调或隔离需要时自动升级：先记录原工作区状态，只转移本任务改动，核对新 worktree 后再移除原目录中对应改动，保留其他已有修改。归属不清时保留原状并报告歧义。
+
+下面的步骤用于受管任务。
 
 ### 1. 添加任务
 
@@ -125,12 +131,50 @@ npx gantt-cli@latest start REQ-0001 --session agent-1 --alias task-api
 ### 3. 合并并完成
 
 ```bash
-npx gantt-cli@latest merge REQ-0001
-npx gantt-cli@latest cleanup REQ-0001
-npx gantt-cli@latest done REQ-0001
+npx gantt-cli@latest finish REQ-0001 --json
 ```
 
-`merge` 会在修改目标分支前检查 assignment 声明的路径范围，并记录准确的 source commit 与 merge commit。合并后不要继续向 assignment branch 添加 commit；如果确实添加了，请再次运行 `merge`。当没有 worktree checkout 该 branch 后，可以选择保留或删除它：`cleanup` 和 `done` 使用已记录的 commit，且 `cleanup` 不会自动删除 branch。
+`finish` 依次检查、合并、验证、保存已分类文件、清理 worktree 并标记 `done`。失败时保留现场，按 JSON 的 `nextAction` 修复并重跑同一命令；Git 冲突在主 worktree 解决并执行 `git merge --continue`，验证失败在保留的任务 worktree 修复提交。没有配置验证命令时会明确说明。任务分支保留，不会自动推送或归档。
+
+旧 `done` 命令已移除；`finish` 是统一收口入口。`merge` 和 `cleanup` 保留用于诊断与修复，`cleanup` 也会先验证再删除。
+
+#### 本地文件保护
+
+任务开始时记录主目录和任务 worktree 的本地文件列表。无关未跟踪文件可以留在主目录；会被覆盖的文件仍会阻止合并。记录是来源证据，文件名和 ignored 状态都不代表可以删除。
+
+应交付的源码正常提交。需要保留的配置、笔记、构建结果或依赖内容，先显式分类：
+
+```bash
+npx gantt-cli@latest classify REQ-0001 --path .env --path build --reason "本地配置与非交付构建结果"
+npx gantt-cli@latest finish REQ-0001 --json
+```
+
+`--path` 是具体文件或目录，不是 glob；目录分类只覆盖当时已有的文件。后续新文件需要单独分类。已分类文件（含 ignored 文件）在清理前保存到 Git common dir 下 `gantt-cli/preserved/<assignment-id>-<unique-key>/`，返回 `assignment.preservationDirectory`；保存位置不会因阶段编号重置而复用。保留相对路径、文件内容和权限；符号链接只保存链接本身，不跟随读取外部内容。
+
+未分类新文件、保存失败或保存目标内容冲突会保留现场。已有副本不会被覆盖：先把旧副本另存，再重跑即可。未提交的跟踪文件修改以及含独有 Git 数据的嵌套仓库继续阻止删除。`release` 后可用 assignment ID 分类，再运行 `discard`；丢弃也遵守相同文件保护。
+
+#### 同文件并行
+
+Agent 可提交以下 `plan.json`，成员数组的顺序就是合并顺序：
+
+```json
+{
+  "members": [
+    { "requirementId": "REQ-0001", "work": "修改请求解析部分" },
+    { "requirementId": "REQ-0002", "work": "修改同文件的输出部分" }
+  ],
+  "verify": "npm test"
+}
+```
+
+```bash
+npx gantt-cli@latest coordinate --plan-file plan.json
+npx gantt-cli@latest schedule --json
+```
+
+有效计划允许同模块或同文件在不同 worktree 同时开发，无需用户逐次授权。合并依次进行，每项收口都运行任务验证和计划的整体验证。真实 `--depends-on` 仍约束启动；仅需控制合并次序时使用计划，不添加启动依赖。示例 Quick start 中的 UI 任务有真实依赖，记录计划不会解除它。
+
+范围变化时重新提交计划；成员可用可选 `paths` 数组同时明确新声明，避免先放宽范围再补记录。计划不能覆盖未列入的任务。新的计划会替换所有与其成员相交的旧计划；若仍要保留其他成员的协调，需把他们一并列入新计划。旧 `--force` 放行方式已移除。
 
 如果 submodule provisioning 失败且 assignment worktree 被保留：
 
@@ -169,7 +213,9 @@ npx gantt-cli@latest archive \
 | `start` | 创建 branch、worktree 和 assignment |
 | `merge` | 将 assignment 合并到目标分支 |
 | `cleanup` | 删除干净且已合并 assignment 的 worktree |
-| `done` | 验证交付事实并完成 requirement |
+| `finish` | 合并、验证、保全文件、清理并标记完成；可重试 |
+| `classify` | 声明要保留的当前本地文件 |
+| `coordinate` | 记录分工、合并顺序及整体验证 |
 | `block` / `unblock` | 标记或解除人工阻塞 |
 | `release` | 释放 assignment，但保留 requirement 和 worktree |
 | `discard` | 删除 released assignment 保留的干净 worktree |
@@ -209,12 +255,12 @@ npx gantt-cli@latest agent-instructions
 
 - 状态保存在 Git common dir 下的 `.git/gantt-cli/state.json`，不会进入项目提交。
 - 写入使用 lock file 和原子替换，避免多个进程破坏状态。
-- worktree 默认放在相邻的 `.gantt-worktrees/` 目录。
+- worktree 默认放在相邻的 `<仓库名>-worktrees/` 目录。
 - `merge` 会在修改主 worktree 前拒绝越界路径，并记录不可变的 source/merge commit 证据。
-- `update` 会把路径声明变更写入事件日志；如果新声明与活动 assignment 冲突，默认拒绝，除非显式使用 `--force`。
-- `cleanup` 会拒绝所有未提交修改，包括递归 submodule 修改；如果嵌套仓库的 Git 数据仅存在于 worktree 内，也会保留 worktree 并拒绝删除。
+- `update` 记录范围变更；重叠范围需要有效协调计划，范围变化后需重新核对计划。
+- `cleanup` 先验证再保全已分类文件；未提交的跟踪文件修改、未分类文件和嵌套仓库独有 Git 数据都会阻止删除。
 - `release` 会保留中断的工作；`discard` 删除 worktree 前采用与 `cleanup` 相同的干净状态和嵌套仓库保护。
-- `done` 使用已记录的 commit 检查合并关系和 worktree 清理情况，不要求 assignment branch 继续存在，然后在主 worktree 中运行可选的验证命令。
+- `finish` 在合并前记录意图，依据准确的提交关系恢复中断；验证绑定目标提交，目标变化后重新验证，验证成功才清理。
 - 验证输出和退出码会记录在 assignment 上；验证失败后仍可修复并重试完成操作。
 - `repair` 会先验证当前 Git 事实，再重试保留的 provisioning failure。
 - Phase 数据位于 `.git/gantt-cli/phases/PHASE-xxx/`；`doctor` 会使用活动状态中记录的哈希验证归档 JSON 和摘要。
@@ -227,7 +273,7 @@ npx gantt-cli@latest agent-instructions
 - scope 冲突来自显式 `--path` 和 `--domain` 声明，不会预测语义或运行时冲突
 - `0.1.0-alpha.0` 阶段暂不保证状态格式向后兼容
 
-运行时没有第三方 npm 依赖。
+运行时仅使用现有的 picocolors 提供终端颜色；调度和 Git 操作使用 Node.js 标准库。
 
 ## 本地开发
 

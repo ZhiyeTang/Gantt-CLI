@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { GitError, ValidationError } from "./errors.js";
@@ -157,12 +158,12 @@ export function rollbackCreatedAssignment(repository: string, branch: string, wo
 export interface SubmoduleChanges { path: string; changes: string[] }
 export interface WorktreeChanges { topLevel: string[]; submodules: SubmoduleChanges[] }
 
-export function worktreeChanges(worktree: string): WorktreeChanges {
-  const topLevel = runGit(worktree, ["status", "--porcelain=v1", "--ignore-submodules=none"])
+export function worktreeChanges(worktree: string, trackedOnly = false): WorktreeChanges {
+  const topLevel = runGit(worktree, ["status", "--porcelain=v1", trackedOnly ? "--ignore-submodules=untracked" : "--ignore-submodules=none", ...(trackedOnly ? ["--untracked-files=no"] : [])])
     .split("\n").filter(Boolean);
   const submodules = runGitResult(worktree, [
     "submodule", "foreach", "--quiet", "--recursive",
-    "status=$(git status --porcelain=v1) || exit $?; if test -n \"$status\"; then printf '%s\\n' \"$status\" | while IFS= read -r line; do printf '%s\\0%s\\0' \"$displaypath\" \"$line\"; done; fi",
+    `status=$(git status --porcelain=v1 ${trackedOnly ? "--untracked-files=no --ignore-submodules=untracked" : ""}) || exit $?; if test -n \"$status\"; then printf '%s\\n' \"$status\" | while IFS= read -r line; do printf '%s\\0%s\\0' \"$displaypath\" \"$line\"; done; fi`,
   ]);
   if (submodules.status !== 0) {
     throw new GitError(
@@ -180,8 +181,8 @@ export function worktreeChanges(worktree: string): WorktreeChanges {
   return { topLevel, submodules: [...grouped].map(([path, changes]) => ({ path, changes })) };
 }
 
-export function ensureWorktreeClean(worktree: string): void {
-  const changes = worktreeChanges(worktree);
+export function ensureWorktreeClean(worktree: string, trackedOnly = false): void {
+  const changes = worktreeChanges(worktree, trackedOnly);
   if (changes.topLevel.length === 0 && changes.submodules.length === 0) return;
   const details: string[] = [];
   if (changes.topLevel.length > 0) {
@@ -234,13 +235,32 @@ export function mergeBranch(
   if (commitIsAncestor(repository, sourceCommit)) {
     throw new GitError(`Assignment source ${sourceCommit} is already in current HEAD; merge would not create a new merge commit.`);
   }
-  ensureWorktreeClean(repository);
-  runGit(repository, ["merge", "--no-ff", "--no-edit", branch]);
+  ensureWorktreeClean(repository, true);
+  const base = runGit(repository, ["merge-base", "HEAD", sourceCommit]).trim();
+  const incoming = changedPathsSince(repository, base, sourceCommit);
+  const collisions = localFiles(repository).filter((path) => incoming.some((changed) => path === changed || path.startsWith(`${changed}/`) || changed.startsWith(`${path}/`)));
+  if (collisions.length) throw new GitError(`Merge would overwrite local files; preserve them before retrying: ${collisions.join(", ")}`);
+  runGit(repository, ["merge", "--no-ff", "--no-edit", "--no-overwrite-ignore", branch]);
   const mergeCommit = headCommit(repository);
   if (commitParent(repository, mergeCommit, 2) !== sourceCommit) {
     throw new GitError(`Git did not create the expected merge commit for assignment source ${sourceCommit}.`);
   }
   return { targetBranch, sourceCommit, mergeCommit };
+}
+
+export function pendingMergeSource(repository: string): string | undefined {
+  const result = runGitResult(repository, ["rev-parse", "--verify", "MERGE_HEAD"]);
+  return result.status === 0 ? result.stdout.trim() : undefined;
+}
+
+export function recoverMerge(repository: string, intent: { targetBranch: string; targetCommit: string; sourceCommit: string }): string | undefined {
+  if (currentBranch(repository) !== intent.targetBranch) throw new GitError(`Pending merge targets ${intent.targetBranch}; restore that checkout before retrying.`);
+  if (pendingMergeSource(repository)) throw new GitError(`Resolve the pending conflict in ${repository}, run git merge --continue, then retry finish.`);
+  if (headCommit(repository) === intent.targetCommit) return undefined;
+  const candidates = runGit(repository, ["rev-list", "--first-parent", "--merges", `${intent.targetCommit}..HEAD`]).trim().split("\n").filter(Boolean);
+  const merge = candidates.find((commit) => commitParent(repository, commit, 1) === intent.targetCommit && commitParent(repository, commit, 2) === intent.sourceCommit && !commitParent(repository, commit, 3));
+  if (!merge) throw new GitError("Target advanced without the recorded merge topology; preserve the work and inspect the pending merge before retrying.");
+  return merge;
 }
 
 export function changedPathsSince(repository: string, baseCommit: string, sourceCommit: string): string[] {
@@ -249,8 +269,8 @@ export function changedPathsSince(repository: string, baseCommit: string, source
   }
   const base = resolveCommit(repository, baseCommit);
   const source = resolveCommit(repository, sourceCommit);
-  return runGit(repository, ["diff", "--name-only", "--no-renames", `${base}..${source}`])
-    .split("\n").filter(Boolean);
+  return runGit(repository, ["diff", "--name-only", "--no-renames", "-z", `${base}..${source}`])
+    .split("\0").filter(Boolean);
 }
 
 function nestedRepositoriesStoredInside(worktree: string): { repository: string; gitDirectory: string }[] {
@@ -286,8 +306,8 @@ function nestedRepositoriesStoredInside(worktree: string): { repository: string;
   return nested;
 }
 
-export function removeWorktree(repository: string, worktree: string): void {
-  ensureWorktreeClean(worktree);
+export function removeWorktree(repository: string, worktree: string, preservation?: { paths: string[]; directory: string }): void {
+  ensureWorktreeClean(worktree, true);
   const nested = nestedRepositoriesStoredInside(worktree);
   if (nested.length > 0) {
     const details = nested.map((item) => {
@@ -301,5 +321,87 @@ export function removeWorktree(repository: string, worktree: string): void {
       "Move or push these repositories to durable storage before cleanup.",
     ].join("\n"));
   }
+  const files = requireClassifiedFiles(worktree, preservation?.paths ?? []);
+  if (preservation) {
+    for (const path of files) {
+      try { preserveFile(worktree, preservation.directory, path); }
+      catch (error) { throw new GitError(`Could not preserve ${path}: ${(error as Error).message}. Worktree retained.`); }
+    }
+    // Check again after copying: files created or modified during preservation must survive.
+    const latest = requireClassifiedFiles(worktree, preservation.paths);
+    if (latest.join("\0") !== files.join("\0")) throw new GitError("Local files changed during preservation; retry cleanup.");
+    for (const path of files) {
+      if (!sameFileContents(safeFilePath(worktree, path), safeFilePath(preservation.directory, path))) {
+        throw new GitError(`Local file changed during preservation: ${path}. Worktree retained.`);
+      }
+    }
+  }
+  ensureWorktreeClean(worktree, true);
   runGit(repository, ["worktree", "remove", "--force", worktree]);
+}
+
+// ponytail: enumerate local files with Git; directory manifests if very large dependency trees become a bottleneck.
+export function localFiles(worktree: string): string[] {
+  const repositories = ["", ...runGit(worktree, ["submodule", "foreach", "--quiet", "--recursive", "printf '%s\\0' \"$displaypath\" "]).split("\0").filter(Boolean)];
+  return [...new Set(repositories.flatMap((prefix) => {
+    const root = join(worktree, prefix);
+    return [false, true].flatMap((ignored) => runGit(root, ["ls-files", "--others", "--exclude-standard", "-z", ...(ignored ? ["--ignored"] : [])])
+      .split("\0").filter(Boolean).map((path) => (prefix ? `${prefix}/${path}` : path).replace(/\/$/, "")));
+  }))].sort();
+}
+
+export function safeFilePath(root: string, path: string): string {
+  const parts = path.split("/");
+  if (!path || path.includes("\\") || path.includes("\0") || parts.some((part) => !part || part === "." || part === ".." || part.toLowerCase() === ".git")) {
+    throw new ValidationError(`Invalid local file path: ${JSON.stringify(path)}`);
+  }
+  let current = resolve(root);
+  const rootMetadata = lstatSync(current, { throwIfNoEntry: false });
+  if (rootMetadata && !rootMetadata.isDirectory()) throw new GitError(`Not a real directory: ${root}`);
+  for (const part of parts.slice(0, -1)) {
+    current = join(current, part);
+    const metadata = lstatSync(current, { throwIfNoEntry: false });
+    if (metadata && !metadata.isDirectory()) throw new GitError(`Refusing symlink or non-directory parent in ${path}`);
+  }
+  return join(root, ...parts);
+}
+
+export function requireClassifiedFiles(worktree: string, classified: string[]): string[] {
+  const files = localFiles(worktree);
+  const allowed = new Set(classified);
+  const unknown = files.filter((path) => !allowed.has(path));
+  if (unknown.length) throw new GitError(`Worktree has uncommitted changes or unclassified local files (including ignored files): ${worktree}\n${unknown.map((path) => `  ${path}`).join("\n")}\nCommit deliverables or run classify with --path and --reason before cleanup.`);
+  return files;
+}
+
+function sameFileContents(source: string, destination: string): boolean {
+  const from = lstatSync(source);
+  const to = lstatSync(destination, { throwIfNoEntry: false });
+  if (!to) return false;
+  if (from.isSymbolicLink()) return to.isSymbolicLink() && readlinkSync(source) === readlinkSync(destination);
+  return from.isFile() && to.isFile() && (from.mode & 0o777) === (to.mode & 0o777) && readFileSync(source).equals(readFileSync(destination));
+}
+
+function preserveFile(worktree: string, directory: string, path: string): void {
+  const source = safeFilePath(worktree, path);
+  const destination = safeFilePath(directory, path);
+  const metadata = lstatSync(source);
+  if (!metadata.isFile() && !metadata.isSymbolicLink()) throw new GitError(`Cannot preserve special file or nested repository: ${path}`);
+  if (lstatSync(destination, { throwIfNoEntry: false })) {
+    if (sameFileContents(source, destination)) return;
+    throw new GitError(`Preservation conflict at ${destination}; retain that copy separately before retrying. Worktree retained.`);
+  }
+  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+  if (metadata.isSymbolicLink()) {
+    symlinkSync(readlinkSync(source), destination);
+    return;
+  }
+  const temporary = join(dirname(destination), `.gantt-preserve-${randomUUID()}`);
+  try {
+    copyFileSync(source, temporary);
+    chmodSync(temporary, metadata.mode & 0o777);
+    const descriptor = openSync(temporary, "r");
+    try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+    linkSync(temporary, destination); // Atomic, exclusive publication; a retry never overwrites a saved file.
+  } finally { rmSync(temporary, { force: true }); }
 }

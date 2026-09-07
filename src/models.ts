@@ -52,10 +52,18 @@ export interface Assignment extends JsonObject {
   branch: string;
   worktree: string;
   baseCommit: string;
+  mergePending?: { targetBranch: string; targetCommit: string; sourceCommit: string };
   sourceCommit?: string;
   mergeCommit?: string;
   mergedInto?: string;
   mergedAt?: string;
+  localBaseline?: { primary: string[]; worktree: string[] };
+  preservePaths?: string[];
+  preservationDirectory?: string;
+  preservationKey?: string;
+  verification?: { command: string; exitCode: number; stdout: string; stderr: string; completedAt: string };
+  verificationTarget?: string;
+  verifiedCommands?: string[];
   cleanupPending?: boolean;
   cleanupAt?: string;
   releasedAt?: string;
@@ -129,7 +137,14 @@ export function parsePhaseArchive(raw: unknown): PhaseArchive {
   return archive;
 }
 
+export interface CoordinationPlan {
+  members: { requirementId: string; work: string; paths: string[]; domains: string[] }[];
+  verify: string;
+  createdAt: string;
+}
+
 export interface State extends JsonObject {
+  coordinationPlans?: CoordinationPlan[];
   schemaVersion: number;
   repository: { root: string; commonGitDir: string };
   createdAt: string;
@@ -593,6 +608,18 @@ function validateCurrentState(state: State): void {
       throw new RegistryError(`Requirement ${requirement.id} has invalid dependencies.`);
     }
   }
+  if (state.coordinationPlans !== undefined) {
+    if (!Array.isArray(state.coordinationPlans)) throw new RegistryError("Invalid coordination plans.");
+    const participants = new Set<string>();
+    for (const plan of state.coordinationPlans) {
+      if (!isObject(plan) || !Array.isArray(plan.members) || plan.members.length < 2 || typeof plan.verify !== "string" || !plan.verify.trim() || typeof plan.createdAt !== "string") throw new RegistryError("Malformed coordination plan.");
+      for (const member of plan.members) {
+        if (!isObject(member) || typeof member.requirementId !== "string" || !requirementIds.has(member.requirementId) || participants.has(member.requirementId)
+          || typeof member.work !== "string" || !member.work.trim() || ![member.paths, member.domains].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))) throw new RegistryError("Malformed or duplicate coordination member.");
+        participants.add(member.requirementId);
+      }
+    }
+  }
   const assignmentIds = new Set<string>();
   for (const assignment of state.assignments) {
     if (!isObject(assignment) || typeof assignment.id !== "string" || !ASSIGNMENT_ID.test(assignment.id)) {
@@ -611,6 +638,15 @@ function validateCurrentState(state: State): void {
         throw new RegistryError(`Assignment ${assignment.id} is missing ${key}.`);
       }
     }
+    const localPath = (value: unknown): value is string => typeof value === "string" && value.length > 0 && !value.includes("\\") && !value.includes("\0") && value.split("/").every((part) => Boolean(part) && part !== "." && part !== ".." && part.toLowerCase() !== ".git");
+    const pathList = (value: unknown): value is string[] => Array.isArray(value) && value.every(localPath);
+    if (assignment.preservePaths !== undefined && !pathList(assignment.preservePaths)) throw new RegistryError(`Assignment ${assignment.id} has invalid preservation paths.`);
+    if (assignment.localBaseline !== undefined && (!isObject(assignment.localBaseline) || !pathList(assignment.localBaseline.primary) || !pathList(assignment.localBaseline.worktree))) throw new RegistryError(`Assignment ${assignment.id} has invalid local baseline.`);
+    if (assignment.preservationKey !== undefined && (typeof assignment.preservationKey !== "string" || !/^[a-f0-9-]{36}$/.test(assignment.preservationKey))) throw new RegistryError(`Assignment ${assignment.id} has invalid preservation key.`);
+    const commit = (value: unknown) => typeof value === "string" && /^[a-f0-9]{40,64}$/.test(value);
+    if (assignment.mergePending !== undefined && (!isObject(assignment.mergePending) || !commit(assignment.mergePending.sourceCommit) || !commit(assignment.mergePending.targetCommit) || typeof assignment.mergePending.targetBranch !== "string" || !assignment.mergePending.targetBranch)) throw new RegistryError(`Assignment ${assignment.id} has invalid pending merge intent.`);
+    if (assignment.verificationTarget !== undefined && !commit(assignment.verificationTarget)) throw new RegistryError(`Assignment ${assignment.id} has invalid verification target.`);
+    if (assignment.verifiedCommands !== undefined && (!Array.isArray(assignment.verifiedCommands) || !assignment.verifiedCommands.every((command) => typeof command === "string" && Boolean(command.trim())))) throw new RegistryError(`Assignment ${assignment.id} has invalid verified commands.`);
     if (assignment.status !== "legacy" && typeof assignment.baseCommit !== "string") {
       throw new RegistryError(`Assignment ${assignment.id} is missing baseCommit.`);
     }

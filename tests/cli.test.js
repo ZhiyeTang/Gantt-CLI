@@ -81,6 +81,14 @@ function writeState(project, state) {
   writeFileSync(statePath(project), `${JSON.stringify(state, null, 2)}\n`);
 }
 
+function coordinate(project, members) {
+  const file = join(dirname(project.repository), "coordination.json");
+  writeFileSync(file, JSON.stringify({ members: members.map((item) => typeof item === "string" ? { requirementId: item, work: `Work for ${item}` } : item), verify: "git diff --check" }));
+  const result = invoke("coordinate", "--repo", project.repository, "--plan-file", file, "--json");
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
 test("init creates a schema-v4 state file through the CLI", () => {
   const project = fixture();
   try {
@@ -116,7 +124,7 @@ test("init installs idempotent managed instructions without replacing existing A
     const installed = readFileSync(instructionsPath, "utf8");
     assert.match(installed, /^# Existing project instructions/);
     assert.match(installed, /<!-- gantt-cli:instructions:start -->/);
-    assert.match(installed, /npx gantt-cli@next agent-instructions/);
+    assert.match(installed, /npx gantt-cli@latest agent-instructions/);
     assert.match(installed, /<!-- gantt-cli:instructions:end -->/);
 
     const second = invoke(
@@ -349,7 +357,7 @@ test("update removes path claims without allowing an empty scope", () => {
   }
 });
 
-test("update rejects new active claim conflicts unless explicitly forced", () => {
+test("update rejects new active claims until a new plan records the expanded scope", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -373,21 +381,14 @@ test("update rejects new active claim conflicts unless explicitly forced", () =>
     assert.equal(rejected.status, 2);
     assert.match(rejected.stderr, /conflicts with active claims held by REQ-0001\/ASN-0001/);
 
-    const forced = invoke(
-      "update", "--repo", project.repository, "REQ-0002", "--add-path", "src/first.ts", "--force", "--json",
-    );
-    assert.equal(forced.status, 0, forced.stderr);
-    const event = JSON.parse(invoke(
-      "log", "--repo", project.repository, "--requirement", "REQ-0002", "--json",
-    ).stdout).events.at(-1);
-    assert.equal(event.data.forced, true);
-    assert.equal(event.data.conflicts[0].requirementId, "REQ-0001");
+    coordinate(project, ["REQ-0001", { requirementId: "REQ-0002", work: "Extend the shared file", paths: ["src/second.ts", "src/first.ts"] }]);
+    assert.deepEqual(JSON.parse(invoke("show", "REQ-0002", "--repo", project.repository, "--json").stdout).paths, ["src/second.ts", "src/first.ts"]);
   } finally {
     project.cleanup();
   }
 });
 
-test("update does not require force again for an existing accepted conflict", () => {
+test("updating an active coordinated scope requires an updated plan", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -400,17 +401,18 @@ test("update does not require force again for an existing accepted conflict", ()
       "start", "--repo", project.repository, "REQ-0001",
       "--session", "session-one", "--alias", "first",
     ).status, 0);
+    coordinate(project, ["REQ-0001", "REQ-0002"]);
     assert.equal(invoke(
       "start", "--repo", project.repository, "REQ-0002",
-      "--session", "session-two", "--alias", "second", "--force",
+      "--session", "session-two", "--alias", "second",
     ).status, 0);
 
     const updated = invoke(
       "update", "--repo", project.repository, "REQ-0002", "--add-path", "Package.resolved", "--json",
     );
 
-    assert.equal(updated.status, 0, updated.stderr);
-    assert.deepEqual(JSON.parse(updated.stdout).requirement.paths, ["src/shared.ts", "Package.resolved"]);
+    assert.equal(updated.status, 2);
+    coordinate(project, ["REQ-0001", { requirementId: "REQ-0002", work: "Shared code and package", paths: ["src/shared.ts", "Package.resolved"] }]);
   } finally {
     project.cleanup();
   }
@@ -476,7 +478,7 @@ test("start binds an assignment to an isolated linked worktree", () => {
   }
 });
 
-test("completion requires merge then cleanup then done", () => {
+test("finish completes submitted work without manually chaining transitions", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -498,20 +500,7 @@ test("completion requires merge then cleanup then done", () => {
     git(assignment.worktree, "add", "src/auth/login.ts");
     git(assignment.worktree, "commit", "-m", "add login");
 
-    const premature = invoke("done", "--repo", project.repository, "REQ-0001");
-    assert.equal(premature.status, 2);
-
-    const merged = invoke("merge", "--repo", project.repository, "REQ-0001", "--json");
-    assert.equal(merged.status, 0, merged.stderr);
-    assert.equal(JSON.parse(merged.stdout).assignment.status, "merged");
-
-    const cleaned = invoke("cleanup", "--repo", project.repository, "REQ-0001", "--json");
-    assert.equal(cleaned.status, 0, cleaned.stderr);
-    const cleanedAssignment = JSON.parse(cleaned.stdout).assignment;
-    assert.equal(cleanedAssignment.status, "cleaned");
-    assert.equal(exists(cleanedAssignment.worktree), false);
-
-    const completed = invoke("done", "--repo", project.repository, "REQ-0001", "--json");
+    const completed = invoke("finish", "--repo", project.repository, "REQ-0001", "--json");
     assert.equal(completed.status, 0, completed.stderr);
     const result = JSON.parse(completed.stdout);
     assert.equal(result.requirement.status, "done");
@@ -542,7 +531,7 @@ test("cleanup force-removes clean submodule worktrees and reports every dirty pa
 
     assert.equal(dirty.status, 2);
     assert.match(dirty.stderr, /dirty\.txt/);
-    assert.match(dirty.stderr, /Submodule vendor\/sample/);
+    assert.match(dirty.stderr, /vendor\/sample\/debug\.log/);
     assert.match(dirty.stderr, /debug\.log/);
 
     rmSync(join(assignment.worktree, "dirty.txt"));
@@ -612,7 +601,7 @@ test("cleanup preserves ignored bare repositories stored inside the worktree", (
   }
 });
 
-test("done and doctor use recorded commits after the merged branch is deleted", () => {
+test("finish and doctor use recorded commits after the merged branch is deleted", () => {
   const project = fixture();
   try {
     const assignment = startAssignment(project);
@@ -631,7 +620,7 @@ test("done and doctor use recorded commits after the merged branch is deleted", 
     assert.equal(diagnosed.status, 0, diagnosed.stderr || diagnosed.stdout);
     assert.equal(JSON.parse(diagnosed.stdout).issues.some((issue) => issue.code === "missing_branch"), false);
 
-    const completed = invoke("done", "--repo", project.repository, "REQ-0001", "--json");
+    const completed = invoke("finish", "--repo", project.repository, "REQ-0001", "--json");
     assert.equal(completed.status, 0, completed.stderr || completed.stdout);
     assert.equal(JSON.parse(completed.stdout).requirement.status, "done");
   } finally {
@@ -747,7 +736,7 @@ test("merge rejects an assignment that would not create a merge commit", () => {
     const merged = invoke("merge", "--repo", project.repository, "REQ-0001");
 
     assert.equal(merged.status, 2);
-    assert.match(merged.stderr, /would not create a new merge commit/);
+    assert.match(merged.stderr, /already in HEAD without recorded merge intent/);
     assert.equal(git(project.repository, "rev-parse", "HEAD").trim(), before);
   } finally {
     project.cleanup();
@@ -807,7 +796,7 @@ test("rollback removes a newly created worktree containing submodules", () => {
   }
 });
 
-test("done preserves a retryable requirement when verification fails", () => {
+test("finish preserves a retryable requirement when verification fails", () => {
   const project = fixture();
   try {
     assert.equal(invoke("init", "--repo", project.repository).status, 0);
@@ -828,14 +817,14 @@ test("done preserves a retryable requirement when verification fails", () => {
     git(assignment.worktree, "add", "src/auth/login.ts");
     git(assignment.worktree, "commit", "-m", "add login");
     assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
-    assert.equal(invoke("cleanup", "--repo", project.repository, "REQ-0001").status, 0);
 
-    const failed = invoke("done", "--repo", project.repository, "REQ-0001", "--json");
+    const failed = invoke("finish", "--repo", project.repository, "REQ-0001", "--json");
 
     assert.equal(failed.status, 3, failed.stderr || failed.stdout);
     const failure = JSON.parse(failed.stdout);
     assert.equal(failure.requirement.status, "active");
-    assert.equal(failure.assignment.status, "cleaned");
+    assert.equal(failure.assignment.status, "merged");
+    assert.equal(exists(assignment.worktree), true);
     assert.equal(failure.assignment.verification.exitCode, 7);
     assert.equal(failure.assignment.verification.stderr, "broken");
     assert.equal(failure.nextAction, "fix_verification");
@@ -1055,7 +1044,7 @@ test("archive creates an immutable phase and restarts all active IDs", () => {
     commitFile(assignment, "src/delivered.ts", "export const delivered = true;\n");
     assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
     assert.equal(invoke("cleanup", "--repo", project.repository, "REQ-0001").status, 0);
-    assert.equal(invoke("done", "--repo", project.repository, "REQ-0001").status, 0);
+    assert.equal(invoke("finish", "--repo", project.repository, "REQ-0001").status, 0);
     assert.equal(invoke(
       "add", "--repo", project.repository, "--request", "Obsolete", "--path", "src/obsolete.ts",
     ).status, 0);
@@ -1303,7 +1292,7 @@ test("doctor reports retained released worktrees as recoverable warnings", () =>
 test("help and agent-instructions expose the complete CLI contract", () => {
   const version = invoke("--version");
   assert.equal(version.status, 0, version.stderr);
-  assert.equal(version.stdout.trim(), "0.1.0-alpha.4");
+  assert.equal(version.stdout.trim(), JSON.parse(readFileSync("package.json", "utf8")).version);
 
   const help = invoke("--help");
   assert.equal(help.status, 0, help.stderr);
@@ -1320,7 +1309,9 @@ test("help and agent-instructions expose the complete CLI contract", () => {
     repair: "<assignment-id>",
     merge: "--into <branch>",
     cleanup: "<requirement-id>",
-    done: "<requirement-id>",
+    finish: "<requirement-id>",
+    classify: "--reason <text>",
+    coordinate: "--plan-file <json-file>",
     block: "--reason <text>",
     unblock: "<requirement-id>",
     release: "--reason <text>",
@@ -1345,7 +1336,9 @@ test("help and agent-instructions expose the complete CLI contract", () => {
   const instructions = invoke("agent-instructions");
   assert.equal(instructions.status, 0, instructions.stderr);
   assert.match(instructions.stdout, /Agent integration contract/);
-  assert.match(instructions.stdout, /npx gantt-cli@next merge.*npx gantt-cli@next cleanup.*npx gantt-cli@next done/);
+  assert.match(instructions.stdout, /inline.*without registering/);
+  assert.match(instructions.stdout, /upgrade.*preserve/i);
+  assert.match(instructions.stdout, /finish REQ-XXXX/);
   assert.match(instructions.stdout, /branch may be retained or deleted/);
   assert.match(instructions.stdout, /release.*discard/);
   assert.match(instructions.stdout, /archive --prepare --json/);
@@ -1379,11 +1372,9 @@ test("start rechecks unfinished dependencies and active claim conflicts", () => 
     );
     assert.equal(conflicted.status, 2);
     assert.match(conflicted.stderr, /conflicts with active claims/);
-    const forced = invoke(
-      "start", "--repo", project.repository, "REQ-0002",
-      "--session", "session-two", "--alias", "login", "--force", "--json",
-    );
-    assert.equal(forced.status, 0, forced.stderr);
+    coordinate(project, ["REQ-0001", "REQ-0002"]);
+    const coordinated = invoke("start", "--repo", project.repository, "REQ-0002", "--session", "session-two", "--alias", "login", "--json");
+    assert.equal(coordinated.status, 0, coordinated.stderr);
 
     const dependent = invoke(
       "start", "--repo", project.repository, "REQ-0003",
@@ -1436,3 +1427,215 @@ function exists(path) {
     throw error;
   }
 }
+
+test("merge leaves unrelated untracked primary configuration untouched", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    writeFileSync(join(project.repository, "local.env"), "secret=original\n");
+    commitFile(assignment, "src/change.ts");
+    const result = invoke("merge", "--repo", project.repository, "REQ-0001");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(project.repository, "local.env"), "utf8"), "secret=original\n");
+  } finally { project.cleanup(); }
+});
+
+test("cleanup preserves classified local and ignored files and blocks new unclassified files", () => {
+  const project = fixture();
+  try {
+    writeFileSync(join(project.repository, ".gitignore"), "private.env\n");
+    git(project.repository, "add", ".gitignore"); git(project.repository, "commit", "-m", "ignore private settings");
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    writeFileSync(join(assignment.worktree, "private.env"), "private=keep\n");
+    writeFileSync(join(assignment.worktree, "local.txt"), "notes\n");
+    const classified = invoke("classify", "--repo", project.repository, "REQ-0001", "--path", "private.env", "--path", "local.txt", "--reason", "local settings", "--json");
+    assert.equal(classified.status, 0, classified.stderr);
+    assert.equal(invoke("merge", "--repo", project.repository, "REQ-0001").status, 0);
+    writeFileSync(join(assignment.worktree, "forgotten.ts"), "deliver me\n");
+    const blocked = invoke("cleanup", "--repo", project.repository, "REQ-0001");
+    assert.equal(blocked.status, 2);
+    assert.match(blocked.stderr, /forgotten.ts/);
+    assert.equal(readFileSync(join(assignment.worktree, "private.env"), "utf8"), "private=keep\n");
+    rmSync(join(assignment.worktree, "forgotten.ts"));
+    const cleaned = invoke("cleanup", "--repo", project.repository, "REQ-0001", "--json");
+    assert.equal(cleaned.status, 0, cleaned.stderr);
+    const saved = JSON.parse(cleaned.stdout).assignment.preservationDirectory;
+    assert.equal(readFileSync(join(saved, "private.env"), "utf8"), "private=keep\n");
+    assert.equal(readFileSync(join(saved, "local.txt"), "utf8"), "notes\n");
+    assert.equal(git(project.repository, "status", "--porcelain"), "");
+  } finally { project.cleanup(); }
+});
+
+test("coordination allows same-file development while enforcing merge order and scope changes", () => {
+  const project = fixture();
+  try {
+    const baseline = Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n") + "\n";
+    writeFileSync(join(project.repository, "README.md"), baseline);
+    git(project.repository, "add", "README.md"); git(project.repository, "commit", "-m", "shared document");
+    invoke("init", "--repo", project.repository);
+    for (const request of ["first", "second", "outsider"]) {
+      assert.equal(invoke("add", "--repo", project.repository, "--request", request, "--path", "README.md").status, 0);
+    }
+    const plan = join(dirname(project.repository), "plan.json");
+    writeFileSync(plan, JSON.stringify({ members: [{ requirementId: "REQ-0001", work: "heading" }, { requirementId: "REQ-0002", work: "footer" }], verify: "git diff --check" }));
+    const coordinated = invoke("coordinate", "--repo", project.repository, "--plan-file", plan, "--json");
+    assert.equal(coordinated.status, 0, coordinated.stderr);
+    const schedule = JSON.parse(invoke("schedule", "--repo", project.repository, "--json").stdout);
+    assert.deepEqual(schedule.batches[0].requirements, ["REQ-0001", "REQ-0002"]);
+    const first = JSON.parse(invoke("start", "REQ-0001", "--repo", project.repository, "--session", "one", "--alias", "one", "--json").stdout).assignment;
+    const second = JSON.parse(invoke("start", "REQ-0002", "--repo", project.repository, "--session", "two", "--alias", "two", "--json").stdout).assignment;
+    assert.equal(invoke("start", "REQ-0003", "--repo", project.repository, "--session", "three", "--alias", "three").status, 2);
+    commitFile(second, "README.md", baseline + "footer\n");
+    const premature = invoke("merge", "REQ-0002", "--repo", project.repository);
+    assert.equal(premature.status, 2);
+    assert.match(premature.stderr, /merge order.*REQ-0001/i);
+    const changed = invoke("update", "REQ-0002", "--repo", project.repository, "--add-path", "src/**");
+    assert.equal(changed.status, 2);
+    commitFile(first, "README.md", baseline.replace("line 0", "new heading"));
+    assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository).status, 0);
+    const integrated = invoke("finish", "REQ-0002", "--repo", project.repository, "--json");
+    assert.equal(integrated.status, 0, integrated.stdout || integrated.stderr);
+    assert.equal(readFileSync(join(project.repository, "README.md"), "utf8"), baseline.replace("line 0", "new heading") + "footer\n");
+    assert.equal(JSON.parse(integrated.stdout).assignment.verification.command, "git diff --check");
+  } finally { project.cleanup(); }
+});
+
+test("finish retains failed verification work, merges a fix, and is repeatable", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { verify: "node -e \"process.exit(require('node:fs').readFileSync('src/result.txt','utf8').trim()==='good'?0:7)\"" });
+    commitFile(assignment, "src/result.txt", "bad\n");
+    const failed = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(failed.status, 3, failed.stderr);
+    assert.equal(JSON.parse(failed.stdout).nextAction, "fix_verification");
+    assert.equal(exists(assignment.worktree), true);
+    commitFile(assignment, "src/result.txt", "good\n");
+    const finished = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(finished.status, 0, finished.stderr);
+    assert.equal(JSON.parse(finished.stdout).requirement.status, "done");
+    assert.equal(exists(assignment.worktree), false);
+    const head = git(project.repository, "rev-parse", "HEAD");
+    assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository).status, 0);
+    assert.equal(git(project.repository, "rev-parse", "HEAD"), head);
+  } finally { project.cleanup(); }
+});
+
+test("finish resumes a manually resolved Git conflict using recorded merge intent", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { path: "README.md" });
+    commitFile(assignment, "README.md", "task heading\n");
+    writeFileSync(join(project.repository, "README.md"), "primary heading\n");
+    git(project.repository, "add", "README.md"); git(project.repository, "commit", "-m", "primary change");
+    assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository, "--json").status, 2);
+    writeFileSync(join(project.repository, "README.md"), "combined heading\n");
+    git(project.repository, "add", "README.md"); git(project.repository, "-c", "core.editor=true", "merge", "--continue");
+    const resolvedHead = git(project.repository, "rev-parse", "HEAD");
+    const retried = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(retried.status, 0, retried.stdout || retried.stderr);
+    assert.equal(git(project.repository, "rev-parse", "HEAD"), resolvedHead);
+    assert.equal(JSON.parse(retried.stdout).assignment.mergeCommit, resolvedHead.trim());
+  } finally { project.cleanup(); }
+});
+
+test("finish recovers when a post-merge hook exposes a state write interruption", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    const hook = join(project.repository, ".git", "hooks", "post-merge");
+    writeFileSync(hook, "#!/bin/sh\nmv .git/gantt-cli/state.json .git/gantt-cli/state.saved\nmkdir .git/gantt-cli/state.json\n", { mode: 0o755 });
+    const interrupted = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(interrupted.status, 2);
+    const head = git(project.repository, "rev-parse", "HEAD");
+    rmSync(statePath(project), { recursive: true });
+    renameSync(join(project.repository, ".git", "gantt-cli", "state.saved"), statePath(project));
+    rmSync(hook);
+    const retried = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(retried.status, 0, retried.stdout || retried.stderr);
+    assert.equal(JSON.parse(retried.stdout).assignment.mergeCommit, head.trim());
+    assert.equal(git(project.repository, "rev-parse", "HEAD"), head);
+  } finally { project.cleanup(); }
+});
+
+test("preservation conflicts keep the source and saved copy intact and are retryable", () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project);
+    commitFile(assignment, "src/change.ts");
+    writeFileSync(join(assignment.worktree, "settings.txt"), "original\n");
+    assert.equal(invoke("classify", "REQ-0001", "--repo", project.repository, "--path", "settings.txt", "--reason", "local").status, 0);
+    assert.equal(invoke("merge", "REQ-0001", "--repo", project.repository).status, 0);
+    // Interrupt deletion through Git's actual worktree lock, after preservation has completed.
+    git(project.repository, "worktree", "lock", assignment.worktree);
+    assert.equal(invoke("cleanup", "REQ-0001", "--repo", project.repository).status, 2);
+    const shown = JSON.parse(invoke("show", "REQ-0001", "--repo", project.repository, "--json").stdout);
+    const saved = shown.assignments[0].preservationDirectory;
+    assert.equal(readFileSync(join(saved, "settings.txt"), "utf8"), "original\n");
+    writeFileSync(join(assignment.worktree, "settings.txt"), "changed\n");
+    git(project.repository, "worktree", "unlock", assignment.worktree);
+    const blocked = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(blocked.status, 2);
+    assert.match(blocked.stdout, /Preservation conflict/);
+    assert.equal(readFileSync(join(assignment.worktree, "settings.txt"), "utf8"), "changed\n");
+    assert.equal(readFileSync(join(saved, "settings.txt"), "utf8"), "original\n");
+    renameSync(join(saved, "settings.txt"), join(saved, "settings.original.txt"));
+    assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository).status, 0);
+    assert.equal(readFileSync(join(saved, "settings.txt"), "utf8"), "changed\n");
+    assert.equal(readFileSync(join(saved, "settings.original.txt"), "utf8"), "original\n");
+  } finally { project.cleanup(); }
+});
+
+test("merge refuses to overwrite an ignored primary file", () => {
+  const project = fixture();
+  try {
+    writeFileSync(join(project.repository, ".gitignore"), "local.env\n");
+    git(project.repository, "add", ".gitignore"); git(project.repository, "commit", "-m", "ignore config");
+    const assignment = startAssignment(project, { path: "local.env" });
+    writeFileSync(join(assignment.worktree, "local.env"), "task\n");
+    git(assignment.worktree, "add", "-f", "local.env"); git(assignment.worktree, "commit", "-m", "deliver config example");
+    writeFileSync(join(project.repository, "local.env"), "keep secret\n");
+    const head = git(project.repository, "rev-parse", "HEAD");
+    assert.equal(invoke("finish", "REQ-0001", "--repo", project.repository, "--json").status, 2);
+    assert.equal(readFileSync(join(project.repository, "local.env"), "utf8"), "keep secret\n");
+    assert.equal(git(project.repository, "rev-parse", "HEAD"), head);
+  } finally { project.cleanup(); }
+});
+
+test("parallel finish calls complete once with consistent merge and verification evidence", async () => {
+  const project = fixture();
+  try {
+    const assignment = startAssignment(project, { verify: "node -e \"Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,200)\"" });
+    commitFile(assignment, "src/change.ts");
+    const results = await Promise.all([1, 2].map(() => invokeAsync("finish", "REQ-0001", "--repo", project.repository, "--json")));
+    for (const result of results) assert.equal(result.status, 0, result.stderr || result.stdout);
+    const first = JSON.parse(results[0].stdout).assignment;
+    const second = JSON.parse(results[1].stdout).assignment;
+    assert.equal(first.mergeCommit, second.mergeCommit);
+    assert.equal(first.verificationTarget, second.verificationTarget);
+    assert.equal(exists(assignment.worktree), false);
+  } finally { project.cleanup(); }
+});
+
+
+test("inline upgrade rehearsal preserves original unrelated edits while starting managed work", () => {
+  const project = fixture();
+  try {
+    const original = "user's existing edits\n";
+    writeFileSync(join(project.repository, "README.md"), original);
+    writeFileSync(join(project.repository, "local.env"), "user settings\n");
+    const before = git(project.repository, "diff", "--", "README.md");
+    // Rehearse the documented Agent procedure through Git and the CLI; no inline state machine exists.
+    writeFileSync(join(project.repository, "feature.txt"), "work completed inline\n");
+    const taskContents = readFileSync(join(project.repository, "feature.txt"));
+    const assignment = startAssignment(project, { path: "feature.txt" });
+    writeFileSync(join(assignment.worktree, "feature.txt"), taskContents);
+    assert.deepEqual(readFileSync(join(assignment.worktree, "feature.txt")), taskContents);
+    rmSync(join(project.repository, "feature.txt"));
+    assert.equal(git(project.repository, "diff", "--", "README.md"), before);
+    assert.equal(readFileSync(join(project.repository, "local.env"), "utf8"), "user settings\n");
+    assert.equal(readFileSync(join(assignment.worktree, "feature.txt"), "utf8"), "work completed inline\n");
+    assert.ok(assignment.localBaseline.primary.includes("local.env"));
+  } finally { project.cleanup(); }
+});
