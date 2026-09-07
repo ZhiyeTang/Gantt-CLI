@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, statSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -1566,6 +1566,7 @@ test("preservation conflicts keep the source and saved copy intact and are retry
     const assignment = startAssignment(project);
     commitFile(assignment, "src/change.ts");
     writeFileSync(join(assignment.worktree, "settings.txt"), "original\n");
+    chmodSync(join(assignment.worktree, "settings.txt"), 0o1750);
     assert.equal(invoke("classify", "REQ-0001", "--repo", project.repository, "--path", "settings.txt", "--reason", "local").status, 0);
     assert.equal(invoke("merge", "REQ-0001", "--repo", project.repository).status, 0);
     // Interrupt deletion through Git's actual worktree lock, after preservation has completed.
@@ -1574,6 +1575,12 @@ test("preservation conflicts keep the source and saved copy intact and are retry
     const shown = JSON.parse(invoke("show", "REQ-0001", "--repo", project.repository, "--json").stdout);
     const saved = shown.assignments[0].preservationDirectory;
     assert.equal(readFileSync(join(saved, "settings.txt"), "utf8"), "original\n");
+    assert.equal(statSync(join(saved, "settings.txt")).mode & 0o7777, 0o1750);
+    chmodSync(join(saved, "settings.txt"), 0o750);
+    const modeConflict = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");
+    assert.equal(modeConflict.status, 2);
+    assert.match(modeConflict.stdout, /Preservation conflict/);
+    chmodSync(join(saved, "settings.txt"), 0o1750);
     writeFileSync(join(assignment.worktree, "settings.txt"), "changed\n");
     git(project.repository, "worktree", "unlock", assignment.worktree);
     const blocked = invoke("finish", "REQ-0001", "--repo", project.repository, "--json");

@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** in-review
+**Status:** done
 
 **Spec:** [按任务需要选择执行流程](../../../docs/specs/adaptive-task-workflow.md)
 

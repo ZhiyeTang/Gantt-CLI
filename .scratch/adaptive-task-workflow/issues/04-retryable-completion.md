@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: 放行无关本地文件，并在清理前自动保全。
 
-**Status:** in-review
+**Status:** done
 
 **Spec:** [按任务需要选择执行流程](../../../docs/specs/adaptive-task-workflow.md)
 

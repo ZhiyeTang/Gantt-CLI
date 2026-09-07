@@ -392,7 +392,7 @@ function sameFileContents(source: string, destination: string): boolean {
   const to = lstatSync(destination, { throwIfNoEntry: false });
   if (!to) return false;
   if (from.isSymbolicLink()) return to.isSymbolicLink() && readlinkSync(source) === readlinkSync(destination);
-  return from.isFile() && to.isFile() && (from.mode & 0o777) === (to.mode & 0o777) && readFileSync(source).equals(readFileSync(destination));
+  return from.isFile() && to.isFile() && (from.mode & 0o7777) === (to.mode & 0o7777) && readFileSync(source).equals(readFileSync(destination));
 }
 
 function preserveFile(worktree: string, directory: string, path: string): void {
@@ -412,7 +412,7 @@ function preserveFile(worktree: string, directory: string, path: string): void {
   const temporary = join(dirname(destination), `.gantt-preserve-${randomUUID()}`);
   try {
     copyFileSync(source, temporary);
-    chmodSync(temporary, metadata.mode & 0o777);
+    chmodSync(temporary, metadata.mode & 0o7777);
     const descriptor = openSync(temporary, "r");
     try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
     linkSync(temporary, destination); // Atomic, exclusive publication; a retry never overwrites a saved file.
